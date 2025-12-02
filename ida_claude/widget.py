@@ -10,6 +10,7 @@ import idc
 from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -19,6 +20,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -117,6 +121,87 @@ class SettingsDialog(QDialog):
         }
 
 
+class ConversationListDialog(QDialog):
+    """Dialog to list, select, and delete conversations."""
+
+    conversation_selected = Signal(str)  # Emits conversation ID (empty = new)
+
+    def __init__(self, manager, parent=None):
+        super().__init__(parent)
+        self.manager = manager
+        self.setWindowTitle("Conversations")
+        self.setMinimumSize(400, 300)
+
+        layout = QVBoxLayout(self)
+
+        # List widget
+        self.list_widget = QListWidget()
+        self.list_widget.itemDoubleClicked.connect(self._on_select)
+        layout.addWidget(self.list_widget)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+
+        self.new_btn = QPushButton("New")
+        self.new_btn.clicked.connect(self._on_new)
+        btn_layout.addWidget(self.new_btn)
+
+        self.load_btn = QPushButton("Load")
+        self.load_btn.clicked.connect(self._on_load)
+        btn_layout.addWidget(self.load_btn)
+
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.clicked.connect(self._on_delete)
+        btn_layout.addWidget(self.delete_btn)
+
+        btn_layout.addStretch()
+
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(self.close_btn)
+
+        layout.addLayout(btn_layout)
+
+        self._refresh_list()
+
+    def _refresh_list(self):
+        self.list_widget.clear()
+        for conv in self.manager.list_conversations():
+            # Format: "Title (date)"
+            date_str = conv["updated_at"][:10] if conv["updated_at"] else ""
+            item = QListWidgetItem(f"{conv['title']} ({date_str})")
+            item.setData(Qt.UserRole, conv["id"])
+            self.list_widget.addItem(item)
+
+    def _on_select(self, item):
+        conv_id = item.data(Qt.UserRole)
+        self.conversation_selected.emit(conv_id)
+        self.accept()
+
+    def _on_load(self):
+        item = self.list_widget.currentItem()
+        if item:
+            self._on_select(item)
+
+    def _on_new(self):
+        self.conversation_selected.emit("")  # Empty = new conversation
+        self.accept()
+
+    def _on_delete(self):
+        item = self.list_widget.currentItem()
+        if item:
+            conv_id = item.data(Qt.UserRole)
+            reply = QMessageBox.question(
+                self,
+                "Delete Conversation",
+                "Delete this conversation?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self.manager.delete_conversation(conv_id)
+                self._refresh_list()
+
+
 def markdown_to_html(text: str) -> str:
     """Convert markdown to HTML."""
     if not text:
@@ -158,14 +243,28 @@ class MessageBlock(QFrame):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(2)
 
-        # Header
+        # Header row with label and copy button
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(4)
+
         self.header = QLabel(self._get_header_text())
         self.header.setStyleSheet(self._get_header_style())
         font = self.header.font()
         font.setBold(True)
         font.setPointSize(9)
         self.header.setFont(font)
-        layout.addWidget(self.header)
+        header_layout.addWidget(self.header)
+
+        header_layout.addStretch()
+
+        self.copy_btn = QPushButton("Copy")
+        self.copy_btn.setFixedSize(40, 18)
+        self.copy_btn.setStyleSheet("font-size: 9px;")
+        self.copy_btn.clicked.connect(self._on_copy)
+        header_layout.addWidget(self.copy_btn)
+
+        layout.addLayout(header_layout)
 
         # Content - use QLabel for simple text, renders HTML fine
         self.content = QLabel()
@@ -240,6 +339,10 @@ class MessageBlock(QFrame):
         else:
             self.content.setText(self._raw_text)
 
+    def _on_copy(self):
+        """Copy raw text to clipboard."""
+        QApplication.clipboard().setText(self._raw_text)
+
 
 class ChatView(QScrollArea):
     """Scrollable container for message blocks."""
@@ -306,6 +409,8 @@ class ChatView(QScrollArea):
                 self.layout.removeWidget(self.thinking_block)
                 self.thinking_block.deleteLater()
             self.thinking_block = None
+            # Force container to recalculate size
+            self.container.adjustSize()
             QTimer.singleShot(10, self._scroll_to_bottom)
 
     def clear_messages(self):
@@ -316,6 +421,8 @@ class ChatView(QScrollArea):
                 item.widget().deleteLater()
         self.current_tool_block = None
         self.thinking_block = None
+        # Force container to recalculate size
+        self.container.adjustSize()
 
     def _scroll_to_bottom(self):
         # Only auto-scroll if already near the bottom
@@ -533,6 +640,7 @@ class ClaudeWidget(idaapi.PluginForm):
         self.signals = Signals()
         self.agent = None
         self.client = None
+        self.conv_manager = None
         self._parent_widget = None
         # Buffered streaming state
         self._stream_buffer = ""
@@ -555,6 +663,23 @@ class ClaudeWidget(idaapi.PluginForm):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
+        # Top bar
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(4)
+
+        self.settings_btn = QPushButton("Settings")
+        top_bar.addWidget(self.settings_btn)
+
+        self.history_btn = QPushButton("History")
+        top_bar.addWidget(self.history_btn)
+
+        top_bar.addStretch()
+
+        self.clear_btn = QPushButton("Clear")
+        top_bar.addWidget(self.clear_btn)
+
+        layout.addLayout(top_bar)
+
         # Chat view
         self.chat_view = ChatView()
         layout.addWidget(self.chat_view, stretch=1)
@@ -567,7 +692,7 @@ class ClaudeWidget(idaapi.PluginForm):
         self.input_box = InputBox()
         layout.addWidget(self.input_box)
 
-        # Buttons and model selector
+        # Bottom buttons
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(4)
 
@@ -577,9 +702,6 @@ class ClaudeWidget(idaapi.PluginForm):
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
         btn_layout.addWidget(self.stop_btn)
-
-        self.clear_btn = QPushButton("Clear")
-        btn_layout.addWidget(self.clear_btn)
 
         btn_layout.addStretch()
 
@@ -604,10 +726,6 @@ class ClaudeWidget(idaapi.PluginForm):
         self.model_selector.setMinimumWidth(150)
         btn_layout.addWidget(self.model_selector)
 
-        # Settings button
-        self.settings_btn = QPushButton("Settings")
-        btn_layout.addWidget(self.settings_btn)
-
         layout.addLayout(btn_layout)
 
         # Status
@@ -619,6 +737,7 @@ class ClaudeWidget(idaapi.PluginForm):
         self.send_btn.clicked.connect(self._on_send_clicked)
         self.stop_btn.clicked.connect(self._on_stop_clicked)
         self.clear_btn.clicked.connect(self._on_clear_clicked)
+        self.history_btn.clicked.connect(self._on_history_clicked)
         self.settings_btn.clicked.connect(self._on_settings_clicked)
         self.think_btn.toggled.connect(self._on_think_toggled)
         self.think_budget_selector.currentIndexChanged.connect(self._on_think_budget_changed)
@@ -649,9 +768,11 @@ class ClaudeWidget(idaapi.PluginForm):
     def _init_agent(self):
         from .client import ClaudeClient
         from .config import get_config
+        from .conversation import get_conversation_manager
         from .loop import AgentLoop
 
         config = get_config()
+        self.conv_manager = get_conversation_manager()
         if not config.api_key:
             self.chat_view.add_message("No API key. Set ANTHROPIC_API_KEY.", "error")
             return
@@ -827,6 +948,9 @@ class ClaudeWidget(idaapi.PluginForm):
                     self.signals.add_assistant_message.emit(self._stream_buffer)
                 self._stream_buffer = ""
                 self._stream_tokens = 0
+                # Auto-save conversation
+                if self.conv_manager and self.agent:
+                    self.conv_manager.save_agent_messages(self.agent.messages)
             except Exception as e:
                 self.signals.finish_thinking.emit("")  # Remove thinking block
                 self.signals.add_error_message.emit(str(e))
@@ -861,6 +985,9 @@ class ClaudeWidget(idaapi.PluginForm):
         self.status_bar.clear_stats()
         if self.agent:
             self.agent.clear_history()
+        # Start a new conversation
+        if self.conv_manager:
+            self.conv_manager.new_conversation()
 
     def _on_settings_clicked(self):
         dialog = SettingsDialog(self._parent_widget)
@@ -893,6 +1020,79 @@ class ClaudeWidget(idaapi.PluginForm):
                 self.agent.client = self.client
 
             self.chat_view.add_message("Settings saved.", "system")
+
+    def _on_history_clicked(self):
+        """Show conversation history dialog."""
+        if not self.conv_manager:
+            return
+        dialog = ConversationListDialog(self.conv_manager, self._parent_widget)
+        dialog.conversation_selected.connect(self._on_conversation_selected)
+        dialog.exec()
+
+    def _on_conversation_selected(self, conv_id: str):
+        """Handle conversation selection from history dialog."""
+        if not conv_id:
+            # New conversation
+            if self.conv_manager:
+                self.conv_manager.new_conversation()
+            self.signals.clear_chat.emit()
+            if self.agent:
+                self.agent.clear_history()
+            self.status_bar.clear_stats()
+            self.chat_view.add_message("Started new conversation.", "system")
+        else:
+            # Load existing conversation
+            self._restore_conversation(conv_id)
+
+    def _restore_conversation(self, conv_id: str):
+        """Restore UI and agent state from a saved conversation."""
+        if not self.conv_manager:
+            return
+
+        messages = self.conv_manager.load_conversation(conv_id)
+        if not messages:
+            self.chat_view.add_message("Failed to load conversation.", "error")
+            return
+
+        # Clear current UI
+        self.signals.clear_chat.emit()
+        self.status_bar.clear_stats()
+
+        # Restore agent messages
+        if self.agent:
+            self.agent.messages = messages
+            self.agent._recent_tool_calls.clear()  # Reset doom loop tracker
+
+        # Replay messages to UI
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "user":
+                # User message - content is string or list with tool_result
+                if isinstance(content, str):
+                    self.chat_view.add_message(content, "user")
+                # Skip tool_result messages in UI (they're shown with tool calls)
+
+            elif role == "assistant":
+                # Assistant message - extract text from content blocks
+                if isinstance(content, str):
+                    self.chat_view.add_message(content, "assistant")
+                elif isinstance(content, list):
+                    # Find text blocks
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                text = block.get("text", "")
+                                if text.strip():
+                                    self.chat_view.add_message(text, "assistant")
+                            elif block.get("type") == "tool_use":
+                                # Show tool call
+                                name = block.get("name", "unknown")
+                                self.chat_view.add_message(f"{name}(...)", "tool")
+
+        title = self.conv_manager.get_conversation_title(conv_id)
+        self.chat_view.add_message(f"Loaded: {title}", "system")
 
     def _on_stream_text(self, text: str):
         # Buffer the text and update token count

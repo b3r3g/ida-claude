@@ -95,6 +95,21 @@ Config stored in IDA user directory: `ida_claude_config.json`
 
 Click **Settings** button in the plugin to edit.
 
+## Conversation History
+
+Conversations are auto-saved after each message and can be resumed later.
+
+**Storage location:**
+- IDA user directory: `<IDA user dir>/ida_claude_conversations/`
+- Fallback: `~/.ida_claude/conversations/`
+
+Each conversation is stored as a JSON file with full message history (including tool calls), allowing perfect resume.
+
+**Usage:**
+- Click **History** button to view/load/delete past conversations
+- Click **Clear** to start a new conversation
+- Conversations are saved automatically
+
 ## Cost
 
 Uses Claude API directly. Typical costs:
