@@ -16,6 +16,9 @@ class Config:
     model: str = "claude-sonnet-4-20250514"
     max_tokens: int = 8192
     auto_refresh: bool = True
+    thinking_enabled: bool = False
+    thinking_budget: int = 10000  # tokens for thinking (min 1024)
+    interleaved_thinking: bool = True  # Enable thinking between tool calls (Claude 4+)
 
     @classmethod
     def load(cls) -> "Config":
@@ -40,6 +43,12 @@ class Config:
                         config.max_tokens = data["max_tokens"]
                     if "auto_refresh" in data:
                         config.auto_refresh = data["auto_refresh"]
+                    if "thinking_enabled" in data:
+                        config.thinking_enabled = data["thinking_enabled"]
+                    if "thinking_budget" in data:
+                        config.thinking_budget = data["thinking_budget"]
+                    if "interleaved_thinking" in data:
+                        config.interleaved_thinking = data["interleaved_thinking"]
             except Exception:
                 pass
 

@@ -10,6 +10,7 @@ import idc
 from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -62,6 +63,11 @@ class SettingsDialog(QDialog):
         self.max_tokens_edit.setPlaceholderText("8192")
         form.addRow("Max Tokens:", self.max_tokens_edit)
 
+        # Interleaved thinking (thinking between tool calls)
+        self.interleaved_checkbox = QCheckBox("Interleaved thinking (Claude 4+)")
+        self.interleaved_checkbox.setToolTip("Allow Claude to think between tool calls")
+        form.addRow("", self.interleaved_checkbox)
+
         layout.addLayout(form)
 
         # Config file path info
@@ -88,6 +94,7 @@ class SettingsDialog(QDialog):
         config = get_config()
         self.api_key_edit.setText(config.api_key)
         self.max_tokens_edit.setText(str(config.max_tokens))
+        self.interleaved_checkbox.setChecked(config.interleaved_thinking)
 
     def _toggle_key_visibility(self, checked: bool):
         if checked:
@@ -106,6 +113,7 @@ class SettingsDialog(QDialog):
         return {
             "api_key": self.api_key_edit.text().strip(),
             "max_tokens": max_tokens,
+            "interleaved_thinking": self.interleaved_checkbox.isChecked(),
         }
 
 
@@ -129,6 +137,8 @@ class Signals(QObject):
     start_thinking = Signal()
     update_thinking = Signal(int)  # token count
     finish_thinking = Signal(str)  # final text
+    # Extended thinking (Claude's reasoning)
+    add_extended_thinking = Signal(str)  # thinking content
     set_status = Signal(str)
     set_usage = Signal(dict)  # usage stats
     clear_chat = Signal()
@@ -177,6 +187,8 @@ class MessageBlock(QFrame):
             return "Tool"
         elif self.role == "error":
             return "Error"
+        elif self.role == "thinking":
+            return "Thinking"
         else:
             return "System"
 
@@ -187,6 +199,8 @@ class MessageBlock(QFrame):
             return "color: #006600;"
         elif self.role == "error":
             return "color: #cc0000;"
+        elif self.role == "thinking":
+            return "color: #996600;"
         else:
             return "color: #666666;"
 
@@ -195,6 +209,8 @@ class MessageBlock(QFrame):
             return "color: #cc0000;"
         elif self.role in ("tool", "system"):
             return "color: #666666;"
+        elif self.role == "thinking":
+            return "color: #666666; font-style: italic;"
         else:
             return ""
 
@@ -205,6 +221,8 @@ class MessageBlock(QFrame):
             return "MessageBlock { background-color: #f0f7f0; border: 1px solid #c4e0c4; }"
         elif self.role == "error":
             return "MessageBlock { background-color: #fee8e8; border: 1px solid #f5c4c4; }"
+        elif self.role == "thinking":
+            return "MessageBlock { background-color: #fff8e8; border: 1px solid #f5e0c4; }"
         else:
             return "MessageBlock { background-color: #f5f5f5; border: 1px solid #e0e0e0; }"
 
@@ -285,7 +303,7 @@ class ChatView(QScrollArea):
                 self.thinking_block.set_text(text)  # Use set_text for markdown
             else:
                 # No text content (just tool calls), remove the block
-                self.thinking_block.setParent(None)
+                self.layout.removeWidget(self.thinking_block)
                 self.thinking_block.deleteLater()
             self.thinking_block = None
             QTimer.singleShot(10, self._scroll_to_bottom)
@@ -519,6 +537,7 @@ class ClaudeWidget(idaapi.PluginForm):
         # Buffered streaming state
         self._stream_buffer = ""
         self._stream_tokens = 0
+        self._thinking_buffer = ""
 
     def OnCreate(self, form):
         self._parent_widget = self.FormToPyQtWidget(form)
@@ -564,6 +583,21 @@ class ClaudeWidget(idaapi.PluginForm):
 
         btn_layout.addStretch()
 
+        # Thinking toggle and budget selector
+        self.think_btn = QPushButton("Think")
+        self.think_btn.setCheckable(True)
+        self.think_btn.setToolTip("Enable extended thinking")
+        btn_layout.addWidget(self.think_btn)
+
+        self.think_budget_selector = QComboBox()
+        self.think_budget_selector.addItem("Light", 4096)
+        self.think_budget_selector.addItem("Medium", 10000)
+        self.think_budget_selector.addItem("Deep", 20000)
+        self.think_budget_selector.setCurrentIndex(1)  # Default to Medium
+        self.think_budget_selector.setEnabled(False)  # Disabled until thinking enabled
+        self.think_budget_selector.setToolTip("Thinking budget (tokens)")
+        btn_layout.addWidget(self.think_budget_selector)
+
         # Model selector
         btn_layout.addWidget(QLabel("Model:"))
         self.model_selector = QComboBox()
@@ -586,6 +620,8 @@ class ClaudeWidget(idaapi.PluginForm):
         self.stop_btn.clicked.connect(self._on_stop_clicked)
         self.clear_btn.clicked.connect(self._on_clear_clicked)
         self.settings_btn.clicked.connect(self._on_settings_clicked)
+        self.think_btn.toggled.connect(self._on_think_toggled)
+        self.think_budget_selector.currentIndexChanged.connect(self._on_think_budget_changed)
 
         # Thread-safe signals
         def add_user_msg(t):
@@ -603,6 +639,9 @@ class ClaudeWidget(idaapi.PluginForm):
         self.signals.start_thinking.connect(self.chat_view.start_thinking)
         self.signals.update_thinking.connect(self.chat_view.update_thinking)
         self.signals.finish_thinking.connect(self.chat_view.finish_thinking)
+        self.signals.add_extended_thinking.connect(
+            lambda t: self.chat_view.add_message(t, "thinking")
+        )
         self.signals.set_status.connect(self.status_bar.set_status)
         self.signals.set_usage.connect(self.status_bar.set_usage)
         self.signals.clear_chat.connect(self.chat_view.clear_messages)
@@ -621,11 +660,15 @@ class ClaudeWidget(idaapi.PluginForm):
             api_key=config.api_key,
             model=config.model,
             max_tokens=config.max_tokens,
+            thinking_enabled=config.thinking_enabled,
+            thinking_budget=config.thinking_budget,
+            interleaved_thinking=config.interleaved_thinking,
         )
 
         self.agent = AgentLoop(
             client=self.client,
             on_text=self._on_stream_text,
+            on_thinking=self._on_extended_thinking,
             on_tool_call=self._on_tool_call,
             on_tool_result=self._on_tool_result,
             on_usage=self._on_usage,
@@ -637,7 +680,18 @@ class ClaudeWidget(idaapi.PluginForm):
         # Connect model change
         self.model_selector.currentIndexChanged.connect(self._on_model_changed)
 
-        self.chat_view.add_message(f"Ready. Model: {config.model}", "system")
+        # Sync thinking UI with config
+        self.think_btn.setChecked(config.thinking_enabled)
+        self.think_budget_selector.setEnabled(config.thinking_enabled)
+        # Find matching budget preset or default to Medium
+        budget_idx = self.think_budget_selector.findData(config.thinking_budget)
+        if budget_idx >= 0:
+            self.think_budget_selector.setCurrentIndex(budget_idx)
+
+        status = f"Ready. Model: {config.model}"
+        if config.thinking_enabled:
+            status += " (thinking enabled)"
+        self.chat_view.add_message(status, "system")
 
     def _load_models(self, current_model: str):
         """Load available models into selector."""
@@ -675,6 +729,63 @@ class ClaudeWidget(idaapi.PluginForm):
             config.model = model_id
             config.save()
 
+    def _on_think_toggled(self, enabled: bool):
+        """Handle thinking toggle."""
+        self.think_budget_selector.setEnabled(enabled)
+
+        if not self.client:
+            return
+
+        # Update client
+        self.client.thinking_enabled = enabled
+        budget = self.think_budget_selector.currentData()
+        self.client.thinking_budget = budget
+
+        # budget_tokens must be < max_tokens, auto-adjust if needed
+        if enabled and budget >= self.client.max_tokens:
+            self.client.max_tokens = budget + 4096  # Room for output
+
+        # Save to config
+        from .config import get_config
+
+        config = get_config()
+        config.thinking_enabled = enabled
+        config.thinking_budget = budget
+        if enabled and budget >= config.max_tokens:
+            config.max_tokens = budget + 4096
+        config.save()
+
+        status = "Thinking enabled" if enabled else "Thinking disabled"
+        if enabled:
+            status += f" ({self.think_budget_selector.currentText()})"
+        self.chat_view.add_message(status, "system")
+
+    def _on_think_budget_changed(self, index: int):
+        """Handle thinking budget change."""
+        if index < 0 or not self.client:
+            return
+
+        budget = self.think_budget_selector.itemData(index)
+        if budget and self.think_btn.isChecked():
+            self.client.thinking_budget = budget
+
+            # budget_tokens must be < max_tokens, auto-adjust if needed
+            if budget >= self.client.max_tokens:
+                self.client.max_tokens = budget + 4096
+
+            # Save to config
+            from .config import get_config
+
+            config = get_config()
+            config.thinking_budget = budget
+            if budget >= config.max_tokens:
+                config.max_tokens = budget + 4096
+            config.save()
+
+            self.chat_view.add_message(
+                f"Thinking budget: {self.think_budget_selector.currentText()}", "system"
+            )
+
     def _on_submit(self, text: str):
         if not text or not self.agent:
             return
@@ -689,9 +800,10 @@ class ClaudeWidget(idaapi.PluginForm):
         self.stop_btn.setEnabled(True)
         self.status_bar.set_status("Thinking...")
 
-        # Reset buffer
+        # Reset buffers
         self._stream_buffer = ""
         self._stream_tokens = 0
+        self._thinking_buffer = ""
         self.signals.start_thinking.emit()
 
         context = self.context_bar.get_context()
@@ -704,8 +816,15 @@ class ClaudeWidget(idaapi.PluginForm):
         def run():
             try:
                 self.agent.chat(prompt, stream=True)
-                # Finish with any remaining buffered text
-                self.signals.finish_thinking.emit(self._stream_buffer)
+                # First, remove the "Thinking..." indicator
+                self.signals.finish_thinking.emit("")
+                # Then display extended thinking (yellow block)
+                if self._thinking_buffer.strip():
+                    self.signals.add_extended_thinking.emit(self._thinking_buffer)
+                    self._thinking_buffer = ""
+                # Then display any remaining text response (green block)
+                if self._stream_buffer.strip():
+                    self.signals.add_assistant_message.emit(self._stream_buffer)
                 self._stream_buffer = ""
                 self._stream_tokens = 0
             except Exception as e:
@@ -754,6 +873,7 @@ class ClaudeWidget(idaapi.PluginForm):
             config = get_config()
             config.api_key = values["api_key"]
             config.max_tokens = values["max_tokens"]
+            config.interleaved_thinking = values["interleaved_thinking"]
             config.save()
 
             # Reinitialize client with new API key/settings
@@ -763,6 +883,9 @@ class ClaudeWidget(idaapi.PluginForm):
                 api_key=config.api_key,
                 model=config.model,
                 max_tokens=config.max_tokens,
+                thinking_enabled=config.thinking_enabled,
+                thinking_budget=config.thinking_budget,
+                interleaved_thinking=config.interleaved_thinking,
             )
 
             # Update agent's client reference
@@ -777,13 +900,26 @@ class ClaudeWidget(idaapi.PluginForm):
         self._stream_tokens += 1  # Rough estimate (actual tokens != chunks)
         self.signals.update_thinking.emit(self._stream_tokens)
 
+    def _on_extended_thinking(self, thinking: str):
+        # Buffer extended thinking for display
+        self._thinking_buffer += thinking
+
     def _on_usage(self, usage: dict):
         # Show stats from this API call (not accumulated)
         self.signals.set_usage.emit(usage)
 
     def _on_tool_call(self, tool_call):
-        # Finish thinking block with buffered text before showing tool
-        self.signals.finish_thinking.emit(self._stream_buffer)
+        # First, remove the "Thinking..." indicator
+        self.signals.finish_thinking.emit("")
+
+        # Then display extended thinking (yellow block)
+        if self._thinking_buffer.strip():
+            self.signals.add_extended_thinking.emit(self._thinking_buffer)
+            self._thinking_buffer = ""
+
+        # Then display any buffered text response (green block)
+        if self._stream_buffer.strip():
+            self.signals.add_assistant_message.emit(self._stream_buffer)
         self._stream_buffer = ""
         self._stream_tokens = 0
 

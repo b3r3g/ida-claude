@@ -28,10 +28,13 @@ class ToolCall:
 class StreamDelta:
     """A chunk of streamed response."""
 
-    type: str  # "text", "tool_use", "done", "usage"
+    type: str  # "text", "tool_use", "done", "usage", "thinking", "signature", "redacted_thinking"
     text: str | None = None
     tool_call: ToolCall | None = None
     usage: dict | None = None
+    thinking: str | None = None
+    signature: str | None = None
+    redacted_data: str | None = None  # For redacted_thinking blocks
 
 
 @dataclass
@@ -42,6 +45,7 @@ class Response:
     tool_calls: list[ToolCall]
     stop_reason: str  # "end_turn", "tool_use", "max_tokens"
     usage: dict | None = None  # Token usage including cache info
+    thinking_blocks: list[dict] | None = None  # Preserved for tool use continuations
 
 
 @dataclass
@@ -61,11 +65,27 @@ class ClaudeClient:
         model: str = "claude-sonnet-4-20250514",
         max_tokens: int = 8192,
         enable_caching: bool = True,
+        thinking_enabled: bool = False,
+        thinking_budget: int = 10000,
+        interleaved_thinking: bool = True,
     ):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
         self.max_tokens = max_tokens
         self.enable_caching = enable_caching
+        self.thinking_enabled = thinking_enabled
+        self.thinking_budget = thinking_budget
+        self.interleaved_thinking = interleaved_thinking
+
+    def _get_extra_headers(self) -> dict | None:
+        """Get extra headers for API requests.
+
+        For direct Claude API calls, interleaved-thinking header has no effect
+        on non-Claude-4 models, so we can always pass it safely.
+        """
+        if self.thinking_enabled and self.interleaved_thinking:
+            return {"anthropic-beta": "interleaved-thinking-2025-05-14"}
+        return None
 
     def list_models(self) -> list[ModelInfo]:
         """List available models."""
@@ -148,12 +168,21 @@ class ClaudeClient:
             kwargs["tools"] = self._make_tools_with_cache(tools)
         if system:
             kwargs["system"] = self._make_system_blocks(system)
+        if self.thinking_enabled:
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self.thinking_budget,
+            }
+        extra_headers = self._get_extra_headers()
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         response = self.client.messages.create(**kwargs)
 
         # Parse response
         content = ""
         tool_calls = []
+        thinking_blocks = []
 
         for block in response.content:
             if block.type == "text":
@@ -166,6 +195,23 @@ class ClaudeClient:
                         input=block.input,
                     )
                 )
+            elif block.type == "thinking":
+                # Preserve thinking blocks for tool use continuations
+                thinking_blocks.append(
+                    {
+                        "type": "thinking",
+                        "thinking": block.thinking,
+                        "signature": block.signature,
+                    }
+                )
+            elif block.type == "redacted_thinking":
+                # Preserve redacted thinking blocks too
+                thinking_blocks.append(
+                    {
+                        "type": "redacted_thinking",
+                        "data": block.data,
+                    }
+                )
 
         usage = self._extract_usage(response)
 
@@ -174,6 +220,7 @@ class ClaudeClient:
             tool_calls=tool_calls,
             stop_reason=response.stop_reason,
             usage=usage,
+            thinking_blocks=thinking_blocks if thinking_blocks else None,
         )
 
     def chat_stream(
@@ -181,7 +228,7 @@ class ClaudeClient:
         messages: list[dict],
         tools: list[dict] | None = None,
         system: str | None = None,
-    ) -> Generator[StreamDelta, None, None]:
+    ) -> Generator[StreamDelta, None, Response]:
         """
         Send a chat request and stream the response.
 
@@ -192,6 +239,9 @@ class ClaudeClient:
 
         Yields:
             StreamDelta chunks
+
+        Returns:
+            Response object with thinking_blocks for tool use preservation
         """
         kwargs = {
             "model": self.model,
@@ -202,10 +252,20 @@ class ClaudeClient:
             kwargs["tools"] = self._make_tools_with_cache(tools)
         if system:
             kwargs["system"] = self._make_system_blocks(system)
+        if self.thinking_enabled:
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self.thinking_budget,
+            }
+        extra_headers = self._get_extra_headers()
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         content = ""
         tool_calls = []
+        thinking_blocks = []
         current_tool: dict | None = None
+        current_thinking: dict | None = None
 
         with self.client.messages.stream(**kwargs) as stream:
             for event in stream:
@@ -216,6 +276,22 @@ class ClaudeClient:
                             "name": event.content_block.name,
                             "input_json": "",
                         }
+                    elif event.content_block.type == "thinking":
+                        current_thinking = {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": None,
+                        }
+                    elif event.content_block.type == "redacted_thinking":
+                        # Redacted thinking blocks come complete, not streamed
+                        redacted_block = {
+                            "type": "redacted_thinking",
+                            "data": event.content_block.data,
+                        }
+                        thinking_blocks.append(redacted_block)
+                        yield StreamDelta(
+                            type="redacted_thinking", redacted_data=event.content_block.data
+                        )
 
                 elif event.type == "content_block_delta":
                     if event.delta.type == "text_delta":
@@ -224,6 +300,14 @@ class ClaudeClient:
                     elif event.delta.type == "input_json_delta":
                         if current_tool:
                             current_tool["input_json"] += event.delta.partial_json
+                    elif event.delta.type == "thinking_delta":
+                        if current_thinking:
+                            current_thinking["thinking"] += event.delta.thinking
+                        yield StreamDelta(type="thinking", thinking=event.delta.thinking)
+                    elif event.delta.type == "signature_delta":
+                        if current_thinking:
+                            current_thinking["signature"] = event.delta.signature
+                        yield StreamDelta(type="signature", signature=event.delta.signature)
 
                 elif event.type == "content_block_stop":
                     if current_tool:
@@ -246,16 +330,27 @@ class ClaudeClient:
                         )
                         yield StreamDelta(type="tool_use", tool_call=tool_calls[-1])
                         current_tool = None
+                    elif current_thinking:
+                        thinking_blocks.append(current_thinking)
+                        current_thinking = None
 
                 elif event.type == "message_stop":
                     pass  # Will handle after getting final message
 
             # Get final message for stop_reason and usage
             final = stream.get_final_message()
-
             usage = self._extract_usage(final)
 
             # Yield usage before done
             if usage:
                 yield StreamDelta(type="usage", usage=usage)
             yield StreamDelta(type="done")
+
+            # Return response with thinking blocks for tool use preservation
+            return Response(
+                content=content,
+                tool_calls=tool_calls,
+                stop_reason=final.stop_reason,
+                usage=usage,
+                thinking_blocks=thinking_blocks if thinking_blocks else None,
+            )

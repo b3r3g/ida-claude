@@ -74,6 +74,7 @@ class AgentLoop:
         config: LoopConfig | None = None,
         system_prompt: str | None = None,
         on_text: Callable[[str], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
         on_tool_call: Callable[[ToolCall], None] | None = None,
         on_tool_result: Callable[[ToolResult], None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
@@ -86,6 +87,7 @@ class AgentLoop:
             config: Loop configuration
             system_prompt: Custom system prompt (uses default if None)
             on_text: Callback for streamed text
+            on_thinking: Callback for streamed thinking
             on_tool_call: Callback when tool is called
             on_tool_result: Callback when tool completes
             on_usage: Callback for usage statistics
@@ -94,6 +96,7 @@ class AgentLoop:
         self.config = config or LoopConfig()
         self.system_prompt = system_prompt or SYSTEM_PROMPT
         self.on_text = on_text
+        self.on_thinking = on_thinking
         self.on_tool_call = on_tool_call
         self.on_tool_result = on_tool_result
         self.on_usage = on_usage
@@ -288,6 +291,8 @@ class AgentLoop:
         """Stream a chat response, calling on_text for each chunk."""
         content = ""
         tool_calls = []
+        thinking_blocks = []
+        current_thinking = {"thinking": "", "signature": None}
         usage = None
 
         for delta in self.client.chat_stream(
@@ -299,11 +304,44 @@ class AgentLoop:
                 content += delta.text
                 if self.on_text:
                     self.on_text(delta.text)
+            elif delta.type == "thinking" and delta.thinking:
+                current_thinking["thinking"] += delta.thinking
+                if self.on_thinking:
+                    self.on_thinking(delta.thinking)
+            elif delta.type == "signature" and delta.signature:
+                current_thinking["signature"] = delta.signature
+            elif delta.type == "redacted_thinking" and delta.redacted_data:
+                # Redacted thinking blocks are complete, add directly
+                thinking_blocks.append(
+                    {
+                        "type": "redacted_thinking",
+                        "data": delta.redacted_data,
+                    }
+                )
             elif delta.type == "tool_use" and delta.tool_call:
+                # Finalize thinking block before tool use
+                if current_thinking["thinking"]:
+                    thinking_blocks.append(
+                        {
+                            "type": "thinking",
+                            "thinking": current_thinking["thinking"],
+                            "signature": current_thinking["signature"],
+                        }
+                    )
+                    current_thinking = {"thinking": "", "signature": None}
                 tool_calls.append(delta.tool_call)
             elif delta.type == "usage" and delta.usage:
                 usage = delta.usage
             elif delta.type == "done":
+                # Finalize any remaining thinking
+                if current_thinking["thinking"]:
+                    thinking_blocks.append(
+                        {
+                            "type": "thinking",
+                            "thinking": current_thinking["thinking"],
+                            "signature": current_thinking["signature"],
+                        }
+                    )
                 break
 
         # Determine stop reason
@@ -314,11 +352,16 @@ class AgentLoop:
             tool_calls=tool_calls,
             stop_reason=stop_reason,
             usage=usage,
+            thinking_blocks=thinking_blocks if thinking_blocks else None,
         )
 
     def _build_assistant_content(self, response: Response) -> list[dict]:
         """Build the assistant message content block."""
         content = []
+
+        # Thinking blocks must come first (required for tool use with thinking)
+        if response.thinking_blocks:
+            content.extend(response.thinking_blocks)
 
         if response.content:
             content.append(
