@@ -1,5 +1,9 @@
 # IDA Claude
 
+<p align="center">
+  <img src="screenshot.png" alt="IDA Claude screenshot" width="600">
+</p>
+
 Claude AI assistant embedded in IDA Pro.
 
 ## Requirements
