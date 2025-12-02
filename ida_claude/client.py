@@ -112,15 +112,14 @@ class ClaudeClient:
     @staticmethod
     def _extract_usage(response) -> dict | None:
         """Extract usage info including cache stats from a response."""
-        if not hasattr(response, "usage"):
+        if not hasattr(response, "usage") or response.usage is None:
             return None
+        usage = response.usage
         return {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-            "cache_creation_input_tokens": getattr(
-                response.usage, "cache_creation_input_tokens", 0
-            ),
-            "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0),
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", None) or 0,
+            "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", None) or 0,
         }
 
     def chat(

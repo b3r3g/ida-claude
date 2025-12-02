@@ -155,3 +155,6 @@ def execute(name: str, input: dict[str, Any]) -> Any:
         raise KeyError(f"Unknown tool: {name}")
 
     return tool_def.handler(**input)
+
+
+from . import ida  # noqa: F401, E402
