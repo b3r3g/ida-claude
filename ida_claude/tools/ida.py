@@ -920,3 +920,88 @@ def redo() -> dict:
 
     success = ida_undo.perform_redo()
     return {"success": success, "action": label}
+
+
+# =============================================================================
+# Script Execution Tools
+# =============================================================================
+
+
+@tool(
+    name="execute_script",
+    description="""Execute Python code inside IDA Pro. The code runs in an isolated namespace without access to the plugin's internal variables.
+
+Use this for complex operations that can't be done with other tools, such as:
+- Custom analysis algorithms
+- Batch operations on multiple addresses/functions
+- Complex data structure parsing
+- Interacting with IDA APIs not exposed by other tools
+
+The code has access to all IDA Python modules (ida_*, idc, idautils, idaapi).
+Any print() output is captured and returned.""",
+    parameters={
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Python code to execute.",
+            },
+        },
+        "required": ["code"],
+    },
+)
+@ida_main_thread
+def execute_script(code: str) -> dict:
+    """Execute Python code inside IDA using IDAPython_ExecScript for isolation."""
+    import io
+    import os
+    import sys
+    import tempfile
+
+    # Create temp file with the code
+    fd, path = tempfile.mkstemp(suffix=".py", prefix="ida_claude_")
+    try:
+        os.write(fd, code.encode("utf-8"))
+        os.close(fd)
+
+        # Fresh globals dict - isolated from plugin namespace
+        exec_globals = {"__name__": "__main__"}
+
+        # Capture stdout/stderr
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+
+        try:
+            sys.stdout = stdout_capture
+            sys.stderr = stderr_capture
+
+            # Run via IDA's official script runner
+            error = idaapi.IDAPython_ExecScript(path, exec_globals, False)
+
+            output = stdout_capture.getvalue()
+            stderr_output = stderr_capture.getvalue()
+            if stderr_output:
+                output = (output + "\n[stderr]\n" + stderr_output).strip()
+
+            if error:
+                return {
+                    "success": False,
+                    "error": error,
+                    "output": output,
+                }
+
+            return {
+                "success": True,
+                "output": output,
+            }
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
