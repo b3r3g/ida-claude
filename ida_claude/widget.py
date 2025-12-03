@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -237,7 +238,7 @@ class MessageBlock(QFrame):
         self.role = role
         self._raw_text = ""  # Store raw text for markdown conversion
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -273,6 +274,7 @@ class MessageBlock(QFrame):
         self.content.setStyleSheet(self._get_content_style())
         self.content.setTextFormat(Qt.RichText)
         self.content.setOpenExternalLinks(False)
+        self.content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         layout.addWidget(self.content)
 
         self.setStyleSheet(self._get_frame_style())
@@ -304,14 +306,15 @@ class MessageBlock(QFrame):
             return "color: #666666;"
 
     def _get_content_style(self) -> str:
+        base = "p { margin: 0; }"  # Reset paragraph margins from HTML/markdown
         if self.role == "error":
-            return "color: #cc0000;"
+            return f"{base} color: #cc0000;"
         elif self.role in ("tool", "system"):
-            return "color: #666666;"
+            return f"{base} color: #666666;"
         elif self.role == "thinking":
-            return "color: #666666; font-style: italic;"
+            return f"{base} color: #666666; font-style: italic;"
         else:
-            return ""
+            return base
 
     def _get_frame_style(self) -> str:
         if self.role == "user":
@@ -349,17 +352,17 @@ class ChatView(QScrollArea):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         # Container widget
         self.container = QWidget()
+        self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self.layout = QVBoxLayout(self.container)
         self.layout.setContentsMargins(4, 4, 4, 4)
         self.layout.setSpacing(8)
-        self.layout.setAlignment(Qt.AlignTop)  # Align messages to top
 
         self.setWidget(self.container)
+        self.setWidgetResizable(True)
 
         self.current_tool_block = None
         self.thinking_block = None
@@ -409,8 +412,8 @@ class ChatView(QScrollArea):
                 self.layout.removeWidget(self.thinking_block)
                 self.thinking_block.deleteLater()
             self.thinking_block = None
-            # Force container to recalculate size
-            self.container.adjustSize()
+            self.layout.invalidate()  # Force layout recalculation
+            self.container.updateGeometry()  # Update container size
             QTimer.singleShot(10, self._scroll_to_bottom)
 
     def clear_messages(self):
@@ -421,8 +424,6 @@ class ChatView(QScrollArea):
                 item.widget().deleteLater()
         self.current_tool_block = None
         self.thinking_block = None
-        # Force container to recalculate size
-        self.container.adjustSize()
 
     def _scroll_to_bottom(self):
         # Only auto-scroll if already near the bottom
@@ -432,8 +433,10 @@ class ChatView(QScrollArea):
             scrollbar.setValue(scrollbar.maximum())
 
     def _force_scroll_to_bottom(self):
-        # Force scroll (used for new user messages)
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
 
 
 class ContextBar(QFrame):
@@ -1079,10 +1082,15 @@ class ClaudeWidget(idaapi.PluginForm):
                 if isinstance(content, str):
                     self.chat_view.add_message(content, "assistant")
                 elif isinstance(content, list):
-                    # Find text blocks
+                    # Find text, thinking, and tool_use blocks
                     for block in content:
                         if isinstance(block, dict):
-                            if block.get("type") == "text":
+                            if block.get("type") == "thinking":
+                                # Show thinking block
+                                thinking_text = block.get("thinking", "")
+                                if thinking_text.strip():
+                                    self.chat_view.add_message(thinking_text, "thinking")
+                            elif block.get("type") == "text":
                                 text = block.get("text", "")
                                 if text.strip():
                                     self.chat_view.add_message(text, "assistant")
