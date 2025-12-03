@@ -9,6 +9,7 @@ allowing the agent to:
 - Search for patterns and cross-references
 """
 
+import contextlib
 from collections.abc import Callable
 from functools import wraps
 from typing import TypeVar
@@ -1001,7 +1002,5 @@ def execute_script(code: str) -> dict:
 
     finally:
         # Clean up temp file
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(path)
-        except OSError:
-            pass

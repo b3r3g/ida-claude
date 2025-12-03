@@ -4,6 +4,9 @@ Custom chat widget for IDA Claude.
 Block-based chat UI where each message is a separate widget.
 """
 
+import json
+import threading
+
 import ida_kernwin
 import idaapi
 import idc
@@ -19,7 +22,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -215,8 +217,8 @@ class Signals(QObject):
 
     add_user_message = Signal(str)
     add_assistant_message = Signal(str)
-    add_tool_message = Signal(str)
-    update_tool_result = Signal(str)  # Update last tool block with result
+    add_tool_message = Signal(str, str)  # (header, raw_json for copying)
+    update_tool_result = Signal(str, str)  # (summary, raw_result_json)
     add_error_message = Signal(str)
     add_system_message = Signal(str)
     # Streaming: show "thinking" with token count, then finalize
@@ -228,14 +230,18 @@ class Signals(QObject):
     set_status = Signal(str)
     set_usage = Signal(dict)  # usage stats
     clear_chat = Signal()
+    # Tool approval (manual mode)
+    request_tool_approval = Signal(str, str, str)  # (tool_name, args_json, tool_id)
+    tool_approval_response = Signal(str, bool)  # (tool_id, approved)
 
 
 class MessageBlock(QFrame):
     """A single message block."""
 
-    def __init__(self, role: str, parent=None):
+    def __init__(self, role: str, header_text: str = None, parent=None):
         super().__init__(parent)
         self.role = role
+        self._header_text = header_text  # Custom header (e.g., tool name)
         self._raw_text = ""  # Store raw text for markdown conversion
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
@@ -261,7 +267,9 @@ class MessageBlock(QFrame):
 
         self.copy_btn = QPushButton("Copy")
         self.copy_btn.setFixedSize(40, 18)
-        self.copy_btn.setStyleSheet("font-size: 9px;")
+        self.copy_btn.setStyleSheet(
+            "font-size: 9px; color: transparent; background: transparent; border: none;"
+        )
         self.copy_btn.clicked.connect(self._on_copy)
         header_layout.addWidget(self.copy_btn)
 
@@ -280,6 +288,8 @@ class MessageBlock(QFrame):
         self.setStyleSheet(self._get_frame_style())
 
     def _get_header_text(self) -> str:
+        if self._header_text:
+            return self._header_text
         if self.role == "user":
             return "You"
         elif self.role == "assistant":
@@ -346,6 +356,18 @@ class MessageBlock(QFrame):
         """Copy raw text to clipboard."""
         QApplication.clipboard().setText(self._raw_text)
 
+    def enterEvent(self, event):
+        """Show copy button on hover."""
+        self.copy_btn.setStyleSheet("font-size: 9px;")
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        """Hide copy button when mouse leaves."""
+        self.copy_btn.setStyleSheet(
+            "font-size: 9px; color: transparent; background: transparent; border: none;"
+        )
+        super().leaveEvent(event)
+
 
 class ChatView(QScrollArea):
     """Scrollable container for message blocks."""
@@ -367,10 +389,20 @@ class ChatView(QScrollArea):
         self.current_tool_block = None
         self.thinking_block = None
 
-    def add_message(self, text: str, role: str) -> MessageBlock:
+        # Debounced scroll timer - prevents flickering from multiple rapid scroll requests
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.setInterval(50)  # 50ms debounce
+        self._scroll_timer.timeout.connect(self._do_scroll_to_bottom)
+
+    def add_message(
+        self, text: str, role: str, header_text: str = None, raw_text: str = None
+    ) -> MessageBlock:
         """Add a new message block."""
-        block = MessageBlock(role)
+        block = MessageBlock(role, header_text=header_text)
         block.set_text(text)
+        if raw_text:
+            block._raw_text = raw_text  # Override for copying (e.g., tool JSON)
 
         self.layout.addWidget(block)
 
@@ -378,24 +410,28 @@ class ChatView(QScrollArea):
         if role == "tool":
             self.current_tool_block = block
 
-        # Scroll to bottom
-        QTimer.singleShot(10, self._scroll_to_bottom)
+        # Scroll to bottom (debounced)
+        self._scroll_to_bottom()
 
         return block
 
-    def update_tool_with_result(self, result: str):
+    def update_tool_with_result(self, result: str, raw_result: str = None):
         """Append result to the current tool block."""
         if self.current_tool_block:
-            self.current_tool_block.append_text("\n-> " + result)
+            # Update visual display only - just show the summary
+            self.current_tool_block.content.setText(result)
+            # Append raw result JSON for copying (to _raw_text only)
+            if raw_result:
+                self.current_tool_block._raw_text += f"\n\nResult:\n{raw_result}"
             self.current_tool_block = None
-            QTimer.singleShot(10, self._scroll_to_bottom)
+            self._scroll_to_bottom()
 
     def start_thinking(self):
         """Show a thinking indicator block."""
         self.thinking_block = MessageBlock("assistant")
         self.thinking_block.content.setText("Thinking...")
         self.layout.addWidget(self.thinking_block)
-        QTimer.singleShot(10, self._scroll_to_bottom)
+        self._scroll_to_bottom()
 
     def update_thinking(self, tokens: int):
         """Update thinking block with token count."""
@@ -414,7 +450,7 @@ class ChatView(QScrollArea):
             self.thinking_block = None
             self.layout.invalidate()  # Force layout recalculation
             self.container.updateGeometry()  # Update container size
-            QTimer.singleShot(10, self._scroll_to_bottom)
+            self._scroll_to_bottom()
 
     def clear_messages(self):
         """Clear all messages."""
@@ -426,6 +462,12 @@ class ChatView(QScrollArea):
         self.thinking_block = None
 
     def _scroll_to_bottom(self):
+        """Request a scroll to bottom (debounced to prevent flickering)."""
+        # Restart the timer - this debounces rapid scroll requests
+        self._scroll_timer.start()
+
+    def _do_scroll_to_bottom(self):
+        """Actually perform the scroll (called by debounce timer)."""
         # Only auto-scroll if already near the bottom
         scrollbar = self.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 50
@@ -433,6 +475,8 @@ class ChatView(QScrollArea):
             scrollbar.setValue(scrollbar.maximum())
 
     def _force_scroll_to_bottom(self):
+        """Immediately scroll to bottom, bypassing debounce."""
+        self._scroll_timer.stop()  # Cancel any pending debounced scroll
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
     def resizeEvent(self, event):
@@ -649,6 +693,11 @@ class ClaudeWidget(idaapi.PluginForm):
         self._stream_buffer = ""
         self._stream_tokens = 0
         self._thinking_buffer = ""
+        self._current_tool_name = ""  # Track current tool for result summaries
+        # Tool approval (manual mode)
+        self._approval_event = threading.Event()
+        self._approval_result = False
+        self._current_approval_id = ""
 
     def OnCreate(self, form):
         self._parent_widget = self.FormToPyQtWidget(form)
@@ -706,6 +755,11 @@ class ClaudeWidget(idaapi.PluginForm):
         self.stop_btn.setEnabled(False)
         btn_layout.addWidget(self.stop_btn)
 
+        # Manual mode checkbox
+        self.manual_mode_cb = QCheckBox("Manual")
+        self.manual_mode_cb.setToolTip("Approve each tool call before execution")
+        btn_layout.addWidget(self.manual_mode_cb)
+
         btn_layout.addStretch()
 
         # Thinking toggle and budget selector
@@ -748,14 +802,21 @@ class ClaudeWidget(idaapi.PluginForm):
         # Thread-safe signals
         def add_user_msg(t):
             self.chat_view.add_message(t, "user")
-            QTimer.singleShot(10, self.chat_view._force_scroll_to_bottom)
+            # Defer to next event loop cycle so layout updates first
+            QTimer.singleShot(0, self.chat_view._force_scroll_to_bottom)
 
         self.signals.add_user_message.connect(add_user_msg)
         self.signals.add_assistant_message.connect(
             lambda t: self.chat_view.add_message(t, "assistant")
         )
-        self.signals.add_tool_message.connect(lambda t: self.chat_view.add_message(t, "tool"))
-        self.signals.update_tool_result.connect(self.chat_view.update_tool_with_result)
+        self.signals.add_tool_message.connect(
+            lambda header, raw: self.chat_view.add_message(
+                "", "tool", header_text=header, raw_text=raw
+            )
+        )
+        self.signals.update_tool_result.connect(
+            lambda summary, raw: self.chat_view.update_tool_with_result(summary, raw)
+        )
         self.signals.add_error_message.connect(lambda t: self.chat_view.add_message(t, "error"))
         self.signals.add_system_message.connect(lambda t: self.chat_view.add_message(t, "system"))
         self.signals.start_thinking.connect(self.chat_view.start_thinking)
@@ -767,6 +828,9 @@ class ClaudeWidget(idaapi.PluginForm):
         self.signals.set_status.connect(self.status_bar.set_status)
         self.signals.set_usage.connect(self.status_bar.set_usage)
         self.signals.clear_chat.connect(self.chat_view.clear_messages)
+        # Tool approval signals (manual mode)
+        self.signals.request_tool_approval.connect(self._show_tool_approval_dialog)
+        self.signals.tool_approval_response.connect(self._on_approval_response)
 
     def _init_agent(self):
         from .client import ClaudeClient
@@ -796,6 +860,7 @@ class ClaudeWidget(idaapi.PluginForm):
             on_tool_call=self._on_tool_call,
             on_tool_result=self._on_tool_result,
             on_usage=self._on_usage,
+            on_tool_approve=self._on_tool_approve,
         )
 
         # Populate model selector
@@ -1095,9 +1160,18 @@ class ClaudeWidget(idaapi.PluginForm):
                                 if text.strip():
                                     self.chat_view.add_message(text, "assistant")
                             elif block.get("type") == "tool_use":
-                                # Show tool call
+                                # Show tool call with formatted args
                                 name = block.get("name", "unknown")
-                                self.chat_view.add_message(f"{name}(...)", "tool")
+                                tool_input = block.get("input", {})
+                                args_parts = []
+                                for k, v in tool_input.items():
+                                    v_str = f'"{v}"' if isinstance(v, str) else str(v)
+                                    if len(v_str) > 30:
+                                        v_str = v_str[:27] + '..."'
+                                    args_parts.append(f"{k}: {v_str}")
+                                args_str = ", ".join(args_parts)
+                                header = f"● {name}({args_str})"
+                                self.chat_view.add_message("", "tool", header_text=header)
 
         title = self.conv_manager.get_conversation_title(conv_id)
         self.chat_view.add_message(f"Loaded: {title}", "system")
@@ -1116,6 +1190,93 @@ class ClaudeWidget(idaapi.PluginForm):
         # Show stats from this API call (not accumulated)
         self.signals.set_usage.emit(usage)
 
+    def _summarize_tool_result(self, tool_name: str, result) -> str:
+        """Generate smart summary for tool results."""
+        if not isinstance(result, dict):
+            s = str(result)
+            return s[:50] + "..." if len(s) > 50 else s
+
+        # Handle errors
+        if "error" in result:
+            err = result["error"]
+            return f"Error: {err[:40]}..." if len(err) > 40 else f"Error: {err}"
+
+        # Tool-specific summaries
+        if tool_name == "get_cursor_position":
+            name = result.get("function_name", "")
+            ea = result.get("ea", "")
+            return f"At {ea}" + (f" in {name}" if name else "")
+
+        elif tool_name == "goto_address":
+            return f"Jumped to {result.get('ea', '?')}"
+
+        elif tool_name == "get_function":
+            name = result.get("name", "?")
+            size = result.get("size", 0)
+            decomp = "decompiled" if result.get("decompiled") else "disasm only"
+            return f"{name} ({size} bytes, {decomp})"
+
+        elif tool_name == "get_disassembly":
+            return f"{result.get('count', 0)} instructions"
+
+        elif tool_name == "get_bytes":
+            return f"Read {result.get('size', 0)} bytes"
+
+        elif tool_name in ("rename_function", "rename_variable"):
+            old = result.get("old_name", "?")
+            new = result.get("new_name", "?")
+            return f"{old} → {new}"
+
+        elif tool_name in ("set_comment", "set_function_comment"):
+            return f"Comment set at {result.get('ea', '?')}"
+
+        elif tool_name in ("get_xrefs_to", "get_xrefs_from"):
+            return f"Found {result.get('count', 0)} xrefs"
+
+        elif tool_name == "list_functions":
+            return f"Listed {result.get('count', 0)} functions"
+
+        elif tool_name == "search_strings":
+            return f"Found {result.get('count', 0)} strings"
+
+        elif tool_name == "refresh_view":
+            return "View refreshed"
+
+        elif tool_name == "get_segment_info":
+            segs = result.get("segments", [])
+            return f"{len(segs)} segments"
+
+        elif tool_name == "take_snapshot":
+            return "Snapshot created"
+
+        elif tool_name == "list_snapshots":
+            snaps = result.get("snapshots", [])
+            return f"{len(snaps)} snapshots"
+
+        elif tool_name == "restore_snapshot":
+            return "Restore initiated"
+
+        elif tool_name == "get_undo_status":
+            undo = result.get("can_undo") or "none"
+            redo = result.get("can_redo") or "none"
+            return f"Undo: {undo}, Redo: {redo}"
+
+        elif tool_name in ("undo", "redo"):
+            action = result.get("action", "")
+            verb = "Undid" if tool_name == "undo" else "Redid"
+            return f"{verb}: {action}" if action else f"{verb} action"
+
+        elif tool_name == "execute_script":
+            output = result.get("output", "")
+            if output:
+                lines = output.count("\n") + 1
+                return f"Executed ({lines} lines output)"
+            return "Executed (no output)"
+
+        # Fallback: truncate JSON
+        s = str(result)
+        return s[:50] + "..." if len(s) > 50 else s
+
     def _on_tool_call(self, tool_call):
         # First, remove the "Thinking..." indicator
         self.signals.finish_thinking.emit("")
@@ -1131,32 +1292,83 @@ class ClaudeWidget(idaapi.PluginForm):
         self._stream_buffer = ""
         self._stream_tokens = 0
 
-        # Format args
+        # Format args with colon style like Claude Code
         args_str = ""
         if tool_call.input:
             args_parts = []
             for k, v in tool_call.input.items():
-                v_str = str(v)
+                # Quote strings, leave others as-is
+                v_str = f'"{v}"' if isinstance(v, str) else str(v)
                 if len(v_str) > 30:
-                    v_str = v_str[:30] + "..."
-                args_parts.append(f"{k}={v_str}")
+                    v_str = v_str[:27] + '..."'
+                args_parts.append(f"{k}: {v_str}")
             args_str = ", ".join(args_parts)
 
-        self.signals.add_tool_message.emit(f"{tool_call.name}({args_str})")
+        header = f"● {tool_call.name}({args_str})"
+
+        # Build raw JSON for copying
+        raw_data = {"tool": tool_call.name, "input": tool_call.input}
+        raw_json = json.dumps(raw_data, indent=2)
+
+        self.signals.add_tool_message.emit(header, raw_json)
         self.signals.set_status.emit(f"Running {tool_call.name}...")
+
+        # Store tool name for result summary
+        self._current_tool_name = tool_call.name
 
         # Start new thinking block for next response
         self.signals.start_thinking.emit()
 
     def _on_tool_result(self, result):
         if result.success:
-            # Show truncated result in same tool block
-            result_str = str(result.result) if result.result else "(no output)"
-            if len(result_str) > 50:
-                result_str = result_str[:50] + "..."
-            self.signals.update_tool_result.emit(result_str)
+            # Show smart summary
+            summary = self._summarize_tool_result(self._current_tool_name, result.result)
+            # Build raw result JSON for copying
+            raw_result = json.dumps(result.result, indent=2) if result.result else ""
+            self.signals.update_tool_result.emit(summary, raw_result)
         else:
             self.signals.add_error_message.emit(result.error)
+
+    def _on_tool_approve(self, tool_call) -> bool:
+        """Called from background thread - must sync with UI for manual mode."""
+        if not self.manual_mode_cb.isChecked():
+            return True  # Auto mode - always approve
+
+        # Reset event
+        self._approval_event.clear()
+        self._current_approval_id = tool_call.id
+
+        # Format args for display
+        args_str = json.dumps(tool_call.input, indent=2)
+
+        # Request approval on main thread
+        self.signals.request_tool_approval.emit(tool_call.name, args_str, tool_call.id)
+
+        # Wait for response (with timeout)
+        self._approval_event.wait(timeout=300)  # 5 min timeout
+
+        return self._approval_result
+
+    def _show_tool_approval_dialog(self, tool_name: str, args_str: str, tool_id: str):
+        """Show dialog asking user to approve tool call (runs on main thread)."""
+        msg = QMessageBox(self._parent_widget)
+        msg.setWindowTitle("Approve Tool Call")
+        msg.setText(f"Allow {tool_name}?")
+        # Truncate very long args
+        display_args = args_str[:500] + "..." if len(args_str) > 500 else args_str
+        msg.setInformativeText(display_args)
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.Yes)
+
+        result = msg.exec()
+        approved = result == QMessageBox.Yes
+        self.signals.tool_approval_response.emit(tool_id, approved)
+
+    def _on_approval_response(self, tool_id: str, approved: bool):
+        """Called on main thread when user responds to dialog."""
+        if tool_id == self._current_approval_id:
+            self._approval_result = approved
+            self._approval_event.set()
 
     def Show(self):
         return idaapi.PluginForm.Show(self, "Claude AI", options=idaapi.PluginForm.WOPN_PERSIST)
