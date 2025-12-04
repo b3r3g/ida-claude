@@ -28,13 +28,18 @@ class ToolCall:
 class StreamDelta:
     """A chunk of streamed response."""
 
-    type: str  # "text", "tool_use", "done", "usage", "thinking", "signature", "redacted_thinking"
+    # Types: "text", "tool_use", "done", "usage", "thinking", "signature", "redacted_thinking"
+    #        "thinking_start", "text_start", "tool_start" (block start events)
+    type: str
     text: str | None = None
     tool_call: ToolCall | None = None
     usage: dict | None = None
     thinking: str | None = None
     signature: str | None = None
     redacted_data: str | None = None  # For redacted_thinking blocks
+    # For block start events
+    tool_name: str | None = None
+    tool_id: str | None = None
 
 
 @dataclass
@@ -266,6 +271,7 @@ class ClaudeClient:
         thinking_blocks = []
         current_tool: dict | None = None
         current_thinking: dict | None = None
+        current_text_block = False  # Track if we're in a text block
 
         with self.client.messages.stream(**kwargs) as stream:
             for event in stream:
@@ -276,12 +282,24 @@ class ClaudeClient:
                             "name": event.content_block.name,
                             "input_json": "",
                         }
+                        # Yield tool start event immediately
+                        yield StreamDelta(
+                            type="tool_start",
+                            tool_name=event.content_block.name,
+                            tool_id=event.content_block.id,
+                        )
                     elif event.content_block.type == "thinking":
                         current_thinking = {
                             "type": "thinking",
                             "thinking": "",
                             "signature": None,
                         }
+                        # Yield thinking start event immediately
+                        yield StreamDelta(type="thinking_start")
+                    elif event.content_block.type == "text":
+                        current_text_block = True
+                        # Yield text start event immediately
+                        yield StreamDelta(type="text_start")
                     elif event.content_block.type == "redacted_thinking":
                         # Redacted thinking blocks come complete, not streamed
                         redacted_block = {
@@ -296,18 +314,16 @@ class ClaudeClient:
                 elif event.type == "content_block_delta":
                     if event.delta.type == "text_delta":
                         content += event.delta.text
-                        yield StreamDelta(type="text", text=event.delta.text)
+                        # Don't yield delta - content will be shown on block complete
                     elif event.delta.type == "input_json_delta":
                         if current_tool:
                             current_tool["input_json"] += event.delta.partial_json
                     elif event.delta.type == "thinking_delta":
                         if current_thinking:
                             current_thinking["thinking"] += event.delta.thinking
-                        yield StreamDelta(type="thinking", thinking=event.delta.thinking)
-                    elif event.delta.type == "signature_delta":
-                        if current_thinking:
-                            current_thinking["signature"] = event.delta.signature
-                        yield StreamDelta(type="signature", signature=event.delta.signature)
+                        # Don't yield delta - content will be shown on block complete
+                    elif event.delta.type == "signature_delta" and current_thinking:
+                        current_thinking["signature"] = event.delta.signature
 
                 elif event.type == "content_block_stop":
                     if current_tool:
@@ -331,8 +347,18 @@ class ClaudeClient:
                         yield StreamDelta(type="tool_use", tool_call=tool_calls[-1])
                         current_tool = None
                     elif current_thinking:
+                        # Yield thinking complete with full content and signature
+                        yield StreamDelta(
+                            type="thinking_complete",
+                            thinking=current_thinking["thinking"],
+                            signature=current_thinking["signature"],
+                        )
                         thinking_blocks.append(current_thinking)
                         current_thinking = None
+                    elif current_text_block:
+                        # Yield text complete with full content
+                        yield StreamDelta(type="text_complete", text=content)
+                        current_text_block = False
 
                 elif event.type == "message_stop":
                     pass  # Will handle after getting final message

@@ -88,12 +88,17 @@ class AgentLoop:
         client: ClaudeClient,
         config: LoopConfig | None = None,
         system_prompt: str | None = None,
-        on_text: Callable[[str], None] | None = None,
-        on_thinking: Callable[[str], None] | None = None,
         on_tool_call: Callable[[ToolCall], None] | None = None,
         on_tool_result: Callable[[ToolResult], None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
         on_tool_approve: Callable[[ToolCall], bool] | None = None,
+        # Block start callbacks
+        on_thinking_start: Callable[[], None] | None = None,
+        on_text_start: Callable[[], None] | None = None,
+        on_tool_start: Callable[[str, str], None] | None = None,  # (tool_name, tool_id)
+        # Block complete callbacks (content shown after block finishes)
+        on_thinking_complete: Callable[[str], None] | None = None,
+        on_text_complete: Callable[[str], None] | None = None,
     ):
         """
         Initialize the agent loop.
@@ -102,22 +107,28 @@ class AgentLoop:
             client: Claude API client
             config: Loop configuration
             system_prompt: Custom system prompt (uses default if None)
-            on_text: Callback for streamed text
-            on_thinking: Callback for streamed thinking
-            on_tool_call: Callback when tool is called
+            on_tool_call: Callback when tool is called (after completion)
             on_tool_result: Callback when tool completes
             on_usage: Callback for usage statistics
             on_tool_approve: Callback to approve tool call (returns True to allow)
+            on_thinking_start: Callback when thinking block starts
+            on_text_start: Callback when text block starts
+            on_tool_start: Callback when tool use block starts (name, id)
+            on_thinking_complete: Callback when thinking block completes (full content)
+            on_text_complete: Callback when text block completes (full content)
         """
         self.client = client
         self.config = config or LoopConfig()
         self.system_prompt = system_prompt or SYSTEM_PROMPT
-        self.on_text = on_text
-        self.on_thinking = on_thinking
         self.on_tool_call = on_tool_call
         self.on_tool_result = on_tool_result
         self.on_usage = on_usage
         self.on_tool_approve = on_tool_approve
+        self.on_thinking_start = on_thinking_start
+        self.on_text_start = on_text_start
+        self.on_tool_start = on_tool_start
+        self.on_thinking_complete = on_thinking_complete
+        self.on_text_complete = on_text_complete
 
         # Conversation state
         self.messages: list[dict] = []
@@ -286,6 +297,21 @@ class AgentLoop:
                 else:
                     consecutive_errors = 0
 
+            # If cancelled, add "cancelled" results for unexecuted tool calls
+            # (same pattern as approval rejection at lines 251-261)
+            if should_stop and self._cancelled.is_set():
+                executed_ids = {r.tool_call_id for r in tool_results}
+                for tc in response.tool_calls:
+                    if tc.id not in executed_ids:
+                        tool_results.append(
+                            ToolResult(
+                                tool_call_id=tc.id,
+                                success=False,
+                                result=None,
+                                error="Cancelled by user",
+                            )
+                        )
+
             # Add tool results to conversation (for all executed tools)
             tool_result_content = []
             for result in tool_results:
@@ -333,16 +359,26 @@ class AgentLoop:
             tools=tools if tools else None,
             system=self.system_prompt,
         ):
-            if delta.type == "text" and delta.text:
-                content += delta.text
-                if self.on_text:
-                    self.on_text(delta.text)
-            elif delta.type == "thinking" and delta.thinking:
-                current_thinking["thinking"] += delta.thinking
-                if self.on_thinking:
-                    self.on_thinking(delta.thinking)
-            elif delta.type == "signature" and delta.signature:
-                current_thinking["signature"] = delta.signature
+            # Block start events
+            if delta.type == "thinking_start":
+                if self.on_thinking_start:
+                    self.on_thinking_start()
+            elif delta.type == "text_start":
+                if self.on_text_start:
+                    self.on_text_start()
+            elif delta.type == "tool_start":
+                if self.on_tool_start:
+                    self.on_tool_start(delta.tool_name, delta.tool_id)
+            # Block complete events (content buffered, shown when block ends)
+            elif delta.type == "thinking_complete" and delta.thinking:
+                current_thinking["thinking"] = delta.thinking
+                current_thinking["signature"] = delta.signature  # Capture signature
+                if self.on_thinking_complete:
+                    self.on_thinking_complete(delta.thinking)
+            elif delta.type == "text_complete" and delta.text:
+                content = delta.text
+                if self.on_text_complete:
+                    self.on_text_complete(delta.text)
             elif delta.type == "redacted_thinking" and delta.redacted_data:
                 # Redacted thinking blocks are complete, add directly
                 thinking_blocks.append(

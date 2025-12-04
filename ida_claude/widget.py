@@ -233,6 +233,13 @@ class Signals(QObject):
     # Tool approval (manual mode)
     request_tool_approval = Signal(str, str, str)  # (tool_name, args_json, tool_id)
     tool_approval_response = Signal(str, bool)  # (tool_id, approved)
+    # Streaming block start events (int = agent_message_index)
+    start_thinking_block = Signal(int)  # Start yellow thinking block
+    start_text_block = Signal(int)  # Start green assistant block
+    start_tool_block = Signal(str, str, int)  # Start tool block (name, id, agent_msg_idx)
+    # Block complete events (content shown after block finishes)
+    complete_thinking_block = Signal(str)  # Set full thinking content
+    complete_text_block = Signal(str)  # Set full text content
 
 
 class MessageBlock(QFrame):
@@ -243,6 +250,9 @@ class MessageBlock(QFrame):
         self.role = role
         self._header_text = header_text  # Custom header (e.g., tool name)
         self._raw_text = ""  # Store raw text for markdown conversion
+        self._collapsed = False
+        self.message_index = None  # Set by ChatView
+        self.agent_message_index = None  # For syncing with agent.messages
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 
@@ -250,7 +260,7 @@ class MessageBlock(QFrame):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(2)
 
-        # Header row with label and copy button
+        # Header row with label and action buttons
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(4)
@@ -265,6 +275,23 @@ class MessageBlock(QFrame):
 
         header_layout.addStretch()
 
+        # Button styling
+        btn_style = """
+            QPushButton {
+                border: none;
+                background: transparent;
+                color: #999;
+                font-size: 11px;
+                padding: 0px 2px;
+            }
+            QPushButton:hover {
+                background: #ddd;
+                color: #333;
+                border-radius: 2px;
+            }
+        """
+
+        # Copy button (first, before other action buttons)
         self.copy_btn = QPushButton("Copy")
         self.copy_btn.setFixedSize(40, 18)
         self.copy_btn.setStyleSheet(
@@ -272,6 +299,32 @@ class MessageBlock(QFrame):
         )
         self.copy_btn.clicked.connect(self._on_copy)
         header_layout.addWidget(self.copy_btn)
+
+        # Redo button (user messages only)
+        self.redo_btn = None
+        if role == "user":
+            self.redo_btn = QPushButton("\u21bb")  # ↻
+            self.redo_btn.setFixedSize(18, 18)
+            self.redo_btn.setToolTip("Redo from this message")
+            self.redo_btn.setStyleSheet(btn_style)
+            self.redo_btn.clicked.connect(self._request_redo)
+            header_layout.addWidget(self.redo_btn)
+
+        # Collapse button
+        self.collapse_btn = QPushButton("\u25bc")  # ▼
+        self.collapse_btn.setFixedSize(18, 18)
+        self.collapse_btn.setToolTip("Collapse/expand")
+        self.collapse_btn.setStyleSheet(btn_style)
+        self.collapse_btn.clicked.connect(self._toggle_collapse)
+        header_layout.addWidget(self.collapse_btn)
+
+        # Remove button
+        self.remove_btn = QPushButton("\u2715")  # ✕
+        self.remove_btn.setFixedSize(18, 18)
+        self.remove_btn.setToolTip("Remove this and following messages")
+        self.remove_btn.setStyleSheet(btn_style)
+        self.remove_btn.clicked.connect(self._request_remove)
+        header_layout.addWidget(self.remove_btn)
 
         layout.addLayout(header_layout)
 
@@ -356,6 +409,37 @@ class MessageBlock(QFrame):
         """Copy raw text to clipboard."""
         QApplication.clipboard().setText(self._raw_text)
 
+    def _toggle_collapse(self):
+        """Toggle collapsed state."""
+        self.set_collapsed(not self._collapsed)
+
+    def set_collapsed(self, collapsed: bool):
+        """Set collapsed state."""
+        self._collapsed = collapsed
+        self.collapse_btn.setText("\u25b6" if collapsed else "\u25bc")  # ▶ or ▼
+        self.content.setVisible(not collapsed)
+
+    def _request_remove(self):
+        """Request removal of this message and following."""
+        chat_view = self._find_chat_view()
+        if chat_view:
+            chat_view.remove_requested.emit(self)
+
+    def _request_redo(self):
+        """Request redo from this message."""
+        chat_view = self._find_chat_view()
+        if chat_view:
+            chat_view.redo_requested.emit(self)
+
+    def _find_chat_view(self):
+        """Find parent ChatView."""
+        parent = self.parent()
+        while parent:
+            if isinstance(parent, ChatView):
+                return parent
+            parent = parent.parent()
+        return None
+
     def enterEvent(self, event):
         """Show copy button on hover."""
         self.copy_btn.setStyleSheet("font-size: 9px;")
@@ -371,6 +455,10 @@ class MessageBlock(QFrame):
 
 class ChatView(QScrollArea):
     """Scrollable container for message blocks."""
+
+    # Signals for message actions
+    remove_requested = Signal(object)  # MessageBlock to remove from
+    redo_requested = Signal(object)  # MessageBlock to redo
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -388,6 +476,11 @@ class ChatView(QScrollArea):
 
         self.current_tool_block = None
         self.thinking_block = None
+        self.message_blocks: list[MessageBlock] = []  # Track all message blocks
+
+        # Streaming blocks (live-updated during response)
+        self.streaming_thinking_block: MessageBlock | None = None
+        self.streaming_text_block: MessageBlock | None = None
 
         # Debounced scroll timer - prevents flickering from multiple rapid scroll requests
         self._scroll_timer = QTimer(self)
@@ -403,6 +496,14 @@ class ChatView(QScrollArea):
         block.set_text(text)
         if raw_text:
             block._raw_text = raw_text  # Override for copying (e.g., tool JSON)
+
+        # Track message block
+        self.message_blocks.append(block)
+        block.message_index = len(self.message_blocks) - 1
+
+        # Default collapse for thinking blocks
+        if role == "thinking":
+            block.set_collapsed(True)
 
         self.layout.addWidget(block)
 
@@ -452,6 +553,58 @@ class ChatView(QScrollArea):
             self.container.updateGeometry()  # Update container size
             self._scroll_to_bottom()
 
+    # Streaming block methods - create blocks immediately when streaming starts
+    def start_streaming_thinking(self, agent_msg_idx: int):
+        """Create a thinking block with placeholder."""
+        self.streaming_thinking_block = MessageBlock("thinking")
+        self.streaming_thinking_block.set_text("...")  # Placeholder
+        self.message_blocks.append(self.streaming_thinking_block)
+        self.streaming_thinking_block.message_index = len(self.message_blocks) - 1
+        self.streaming_thinking_block.agent_message_index = agent_msg_idx
+        self.streaming_thinking_block.set_collapsed(True)  # Start collapsed
+        self.layout.addWidget(self.streaming_thinking_block)
+        self._scroll_to_bottom()
+
+    def complete_streaming_thinking(self, content: str):
+        """Set final content for thinking block."""
+        if self.streaming_thinking_block:
+            self.streaming_thinking_block.set_text(content)
+            self._scroll_to_bottom()
+
+    def start_streaming_text(self, agent_msg_idx: int):
+        """Create an assistant text block with placeholder."""
+        self.streaming_text_block = MessageBlock("assistant")
+        self.streaming_text_block.set_text("...")  # Placeholder
+        self.message_blocks.append(self.streaming_text_block)
+        self.streaming_text_block.message_index = len(self.message_blocks) - 1
+        self.streaming_text_block.agent_message_index = agent_msg_idx
+        self.layout.addWidget(self.streaming_text_block)
+        self._scroll_to_bottom()
+
+    def complete_streaming_text(self, content: str):
+        """Set final content for text block."""
+        if self.streaming_text_block:
+            self.streaming_text_block.set_text(content)
+            self._scroll_to_bottom()
+
+    def start_streaming_tool(self, tool_name: str, tool_id: str, agent_msg_idx: int):
+        """Create a tool block when tool use starts streaming."""
+        header = f"\u25cf {tool_name}"  # ● tool_name
+        block = MessageBlock("tool", header_text=header)
+        block.set_text("...")  # Placeholder while input streams
+        block._raw_text = f"Tool: {tool_name}\nID: {tool_id}\n"
+        self.message_blocks.append(block)
+        block.message_index = len(self.message_blocks) - 1
+        block.agent_message_index = agent_msg_idx
+        self.current_tool_block = block
+        self.layout.addWidget(block)
+        self._scroll_to_bottom()
+
+    def finish_streaming(self):
+        """Clean up streaming block references after response completes."""
+        self.streaming_thinking_block = None
+        self.streaming_text_block = None
+
     def clear_messages(self):
         """Clear all messages."""
         while self.layout.count() > 0:
@@ -460,6 +613,29 @@ class ChatView(QScrollArea):
                 item.widget().deleteLater()
         self.current_tool_block = None
         self.thinking_block = None
+        self.streaming_thinking_block = None
+        self.streaming_text_block = None
+        self.message_blocks.clear()
+
+    def remove_from(self, block: MessageBlock):
+        """Remove block and all following blocks."""
+        if block not in self.message_blocks:
+            return
+        idx = self.message_blocks.index(block)
+
+        # Remove from UI
+        for b in self.message_blocks[idx:]:
+            self.layout.removeWidget(b)
+            b.deleteLater()
+
+        # Update tracking
+        self.message_blocks = self.message_blocks[:idx]
+
+        # Clear references if removed
+        if self.current_tool_block and self.current_tool_block not in self.message_blocks:
+            self.current_tool_block = None
+        if self.thinking_block and self.thinking_block not in self.message_blocks:
+            self.thinking_block = None
 
     def _scroll_to_bottom(self):
         """Request a scroll to bottom (debounced to prevent flickering)."""
@@ -468,15 +644,13 @@ class ChatView(QScrollArea):
 
     def _do_scroll_to_bottom(self):
         """Actually perform the scroll (called by debounce timer)."""
-        # Only auto-scroll if already near the bottom
-        scrollbar = self.verticalScrollBar()
-        at_bottom = scrollbar.value() >= scrollbar.maximum() - 50
-        if at_bottom:
-            scrollbar.setValue(scrollbar.maximum())
+        # Force Qt to process pending layout changes before reading scroll position
+        self.container.updateGeometry()
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
     def _force_scroll_to_bottom(self):
         """Immediately scroll to bottom, bypassing debounce."""
-        self._scroll_timer.stop()  # Cancel any pending debounced scroll
+        self.container.updateGeometry()
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
     def resizeEvent(self, event):
@@ -689,10 +863,6 @@ class ClaudeWidget(idaapi.PluginForm):
         self.client = None
         self.conv_manager = None
         self._parent_widget = None
-        # Buffered streaming state
-        self._stream_buffer = ""
-        self._stream_tokens = 0
-        self._thinking_buffer = ""
         self._current_tool_name = ""  # Track current tool for result summaries
         # Tool approval (manual mode)
         self._approval_event = threading.Event()
@@ -801,7 +971,12 @@ class ClaudeWidget(idaapi.PluginForm):
 
         # Thread-safe signals
         def add_user_msg(t):
-            self.chat_view.add_message(t, "user")
+            block = self.chat_view.add_message(t, "user")
+            # Track agent message index for syncing
+            # Note: message will be added to agent.messages when chat() is called,
+            # so the index is the current length (where it will be added)
+            if self.agent:
+                block.agent_message_index = len(self.agent.messages)
             # Defer to next event loop cycle so layout updates first
             QTimer.singleShot(0, self.chat_view._force_scroll_to_bottom)
 
@@ -831,6 +1006,15 @@ class ClaudeWidget(idaapi.PluginForm):
         # Tool approval signals (manual mode)
         self.signals.request_tool_approval.connect(self._show_tool_approval_dialog)
         self.signals.tool_approval_response.connect(self._on_approval_response)
+        # ChatView message action signals
+        self.chat_view.remove_requested.connect(self._on_remove_message)
+        self.chat_view.redo_requested.connect(self._on_redo_message)
+        # Streaming block signals
+        self.signals.start_thinking_block.connect(self.chat_view.start_streaming_thinking)
+        self.signals.start_text_block.connect(self.chat_view.start_streaming_text)
+        self.signals.start_tool_block.connect(self.chat_view.start_streaming_tool)
+        self.signals.complete_thinking_block.connect(self.chat_view.complete_streaming_thinking)
+        self.signals.complete_text_block.connect(self.chat_view.complete_streaming_text)
 
     def _init_agent(self):
         from .client import ClaudeClient
@@ -855,12 +1039,17 @@ class ClaudeWidget(idaapi.PluginForm):
 
         self.agent = AgentLoop(
             client=self.client,
-            on_text=self._on_stream_text,
-            on_thinking=self._on_extended_thinking,
             on_tool_call=self._on_tool_call,
             on_tool_result=self._on_tool_result,
             on_usage=self._on_usage,
             on_tool_approve=self._on_tool_approve,
+            # Block start callbacks
+            on_thinking_start=self._on_thinking_start,
+            on_text_start=self._on_text_start,
+            on_tool_start=self._on_tool_start,
+            # Block complete callbacks
+            on_thinking_complete=self._on_thinking_complete,
+            on_text_complete=self._on_text_complete,
         )
 
         # Populate model selector
@@ -989,10 +1178,7 @@ class ClaudeWidget(idaapi.PluginForm):
         self.stop_btn.setEnabled(True)
         self.status_bar.set_status("Thinking...")
 
-        # Reset buffers
-        self._stream_buffer = ""
-        self._stream_tokens = 0
-        self._thinking_buffer = ""
+        # Show "Thinking..." placeholder (will be replaced when actual block starts)
         self.signals.start_thinking.emit()
 
         context = self.context_bar.get_context()
@@ -1005,22 +1191,18 @@ class ClaudeWidget(idaapi.PluginForm):
         def run():
             try:
                 self.agent.chat(prompt, stream=True)
-                # First, remove the "Thinking..." indicator
+                # Clean up - streaming blocks were created/updated during streaming
+                # Remove "Thinking..." placeholder if it wasn't replaced (no thinking/text blocks)
                 self.signals.finish_thinking.emit("")
-                # Then display extended thinking (yellow block)
-                if self._thinking_buffer.strip():
-                    self.signals.add_extended_thinking.emit(self._thinking_buffer)
-                    self._thinking_buffer = ""
-                # Then display any remaining text response (green block)
-                if self._stream_buffer.strip():
-                    self.signals.add_assistant_message.emit(self._stream_buffer)
-                self._stream_buffer = ""
-                self._stream_tokens = 0
+                # Clean up streaming block references
+                ida_kernwin.execute_sync(
+                    lambda: self.chat_view.finish_streaming(), ida_kernwin.MFF_FAST
+                )
                 # Auto-save conversation
                 if self.conv_manager and self.agent:
                     self.conv_manager.save_agent_messages(self.agent.messages)
             except Exception as e:
-                self.signals.finish_thinking.emit("")  # Remove thinking block
+                self.signals.finish_thinking.emit("")  # Remove thinking placeholder
                 self.signals.add_error_message.emit(str(e))
             finally:
                 ida_kernwin.execute_sync(self._reset_ui, ida_kernwin.MFF_FAST)
@@ -1056,6 +1238,49 @@ class ClaudeWidget(idaapi.PluginForm):
         # Start a new conversation
         if self.conv_manager:
             self.conv_manager.new_conversation()
+
+    def _on_remove_message(self, block):
+        """Remove message and all following, truncate agent history."""
+        if not self.agent:
+            return
+
+        # Get agent_message_index from the clicked block
+        agent_idx = block.agent_message_index
+        if agent_idx is None:
+            return
+
+        # Find the first UI block with this agent_message_index
+        # (e.g., if clicking on text block, we also want to remove the thinking block before it)
+        first_block = block
+        for b in self.chat_view.message_blocks:
+            if b.agent_message_index == agent_idx:
+                first_block = b
+                break
+
+        # Truncate agent messages
+        self.agent.messages = self.agent.messages[:agent_idx]
+
+        # Remove from UI (from first block with this index onward)
+        self.chat_view.remove_from(first_block)
+
+        # Save updated conversation
+        if self.conv_manager and self.agent:
+            self.conv_manager.save_agent_messages(self.agent.messages)
+
+    def _on_redo_message(self, block):
+        """Redo from a user message - remove and resubmit."""
+        if block.role != "user":
+            return
+
+        # Get the message text before removing
+        text = block._raw_text or block.content.toPlainText()
+
+        # Remove this message and everything after
+        self._on_remove_message(block)
+
+        # Resubmit the message
+        if text.strip():
+            self._on_submit(text)
 
     def _on_settings_clicked(self):
         dialog = SettingsDialog(self._parent_widget)
@@ -1176,15 +1401,34 @@ class ClaudeWidget(idaapi.PluginForm):
         title = self.conv_manager.get_conversation_title(conv_id)
         self.chat_view.add_message(f"Loaded: {title}", "system")
 
-    def _on_stream_text(self, text: str):
-        # Buffer the text and update token count
-        self._stream_buffer += text
-        self._stream_tokens += 1  # Rough estimate (actual tokens != chunks)
-        self.signals.update_thinking.emit(self._stream_tokens)
+    # Block start callbacks - create UI blocks immediately when streaming starts
+    def _on_thinking_start(self):
+        """Called when a thinking block starts streaming."""
+        # Remove the old "Thinking..." placeholder if it exists
+        self.signals.finish_thinking.emit("")
+        # Start the actual thinking block with agent message index
+        # The assistant message will be at len(agent.messages) when added
+        agent_msg_idx = len(self.agent.messages) if self.agent else 0
+        self.signals.start_thinking_block.emit(agent_msg_idx)
 
-    def _on_extended_thinking(self, thinking: str):
-        # Buffer extended thinking for display
-        self._thinking_buffer += thinking
+    def _on_text_start(self):
+        """Called when a text block starts streaming."""
+        agent_msg_idx = len(self.agent.messages) if self.agent else 0
+        self.signals.start_text_block.emit(agent_msg_idx)
+
+    def _on_tool_start(self, tool_name: str, tool_id: str):
+        """Called when a tool use block starts streaming."""
+        agent_msg_idx = len(self.agent.messages) if self.agent else 0
+        self.signals.start_tool_block.emit(tool_name, tool_id, agent_msg_idx)
+
+    # Block complete callbacks - set content when block finishes
+    def _on_thinking_complete(self, content: str):
+        """Called when a thinking block completes with full content."""
+        self.signals.complete_thinking_block.emit(content)
+
+    def _on_text_complete(self, content: str):
+        """Called when a text block completes with full content."""
+        self.signals.complete_text_block.emit(content)
 
     def _on_usage(self, usage: dict):
         # Show stats from this API call (not accumulated)
@@ -1278,19 +1522,12 @@ class ClaudeWidget(idaapi.PluginForm):
         return s[:50] + "..." if len(s) > 50 else s
 
     def _on_tool_call(self, tool_call):
-        # First, remove the "Thinking..." indicator
+        # Remove the "Thinking..." placeholder if it wasn't replaced
         self.signals.finish_thinking.emit("")
 
-        # Then display extended thinking (yellow block)
-        if self._thinking_buffer.strip():
-            self.signals.add_extended_thinking.emit(self._thinking_buffer)
-            self._thinking_buffer = ""
-
-        # Then display any buffered text response (green block)
-        if self._stream_buffer.strip():
-            self.signals.add_assistant_message.emit(self._stream_buffer)
-        self._stream_buffer = ""
-        self._stream_tokens = 0
+        # Note: With streaming, thinking and text blocks were already created
+        # and filled by block start events and stream callbacks.
+        # The tool block was created by tool_start, now update it with full args.
 
         # Format args with colon style like Claude Code
         args_str = ""
@@ -1304,19 +1541,28 @@ class ClaudeWidget(idaapi.PluginForm):
                 args_parts.append(f"{k}: {v_str}")
             args_str = ", ".join(args_parts)
 
-        header = f"● {tool_call.name}({args_str})"
+        header = f"\u25cf {tool_call.name}({args_str})"  # ● tool_name(args)
 
         # Build raw JSON for copying
         raw_data = {"tool": tool_call.name, "input": tool_call.input}
         raw_json = json.dumps(raw_data, indent=2)
 
-        self.signals.add_tool_message.emit(header, raw_json)
+        # Update existing tool block (created by tool_start) or create new one
+        if self.chat_view.current_tool_block:
+            # Update the header and raw text of existing block
+            self.chat_view.current_tool_block.header.setText(header)
+            self.chat_view.current_tool_block._raw_text = raw_json
+            self.chat_view.current_tool_block.set_text("")  # Clear "..." placeholder
+        else:
+            # Fallback: create new block if tool_start didn't create one
+            self.signals.add_tool_message.emit(header, raw_json)
+
         self.signals.set_status.emit(f"Running {tool_call.name}...")
 
         # Store tool name for result summary
         self._current_tool_name = tool_call.name
 
-        # Start new thinking block for next response
+        # Start new thinking block for next response (after tool result comes back)
         self.signals.start_thinking.emit()
 
     def _on_tool_result(self, result):
