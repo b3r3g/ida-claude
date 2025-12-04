@@ -217,8 +217,8 @@ class Signals(QObject):
 
     add_user_message = Signal(str)
     add_assistant_message = Signal(str)
-    add_tool_message = Signal(str, str)  # (header, raw_json for copying)
-    update_tool_result = Signal(str, str)  # (summary, raw_result_json)
+    add_tool_message = Signal(str, str, str)  # (tool_id, header, raw_json for copying)
+    update_tool_result = Signal(str, str, str)  # (tool_id, summary, raw_result_json)
     add_error_message = Signal(str)
     add_system_message = Signal(str)
     # Streaming: show "thinking" with token count, then finalize
@@ -474,7 +474,7 @@ class ChatView(QScrollArea):
         self.setWidget(self.container)
         self.setWidgetResizable(True)
 
-        self.current_tool_block = None
+        self.tool_blocks: dict[str, MessageBlock] = {}  # Track tool blocks by tool_id
         self.thinking_block = None
         self.message_blocks: list[MessageBlock] = []  # Track all message blocks
 
@@ -507,24 +507,22 @@ class ChatView(QScrollArea):
 
         self.layout.addWidget(block)
 
-        # Track tool block for result updates
-        if role == "tool":
-            self.current_tool_block = block
-
         # Scroll to bottom (debounced)
         self._scroll_to_bottom()
 
         return block
 
-    def update_tool_with_result(self, result: str, raw_result: str = None):
-        """Append result to the current tool block."""
-        if self.current_tool_block:
+    def update_tool_with_result(self, tool_id: str, result: str, raw_result: str = None):
+        """Update a specific tool block with its result."""
+        block = self.tool_blocks.get(tool_id)
+        if block:
             # Update visual display only - just show the summary
-            self.current_tool_block.content.setText(result)
+            block.content.setText(result)
             # Append raw result JSON for copying (to _raw_text only)
             if raw_result:
-                self.current_tool_block._raw_text += f"\n\nResult:\n{raw_result}"
-            self.current_tool_block = None
+                block._raw_text += f"\n\nResult:\n{raw_result}"
+            # Remove from tracking dict
+            del self.tool_blocks[tool_id]
             self._scroll_to_bottom()
 
     def start_thinking(self):
@@ -596,7 +594,7 @@ class ChatView(QScrollArea):
         self.message_blocks.append(block)
         block.message_index = len(self.message_blocks) - 1
         block.agent_message_index = agent_msg_idx
-        self.current_tool_block = block
+        self.tool_blocks[tool_id] = block  # Track by tool_id
         self.layout.addWidget(block)
         self._scroll_to_bottom()
 
@@ -611,7 +609,7 @@ class ChatView(QScrollArea):
             item = self.layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        self.current_tool_block = None
+        self.tool_blocks.clear()
         self.thinking_block = None
         self.streaming_thinking_block = None
         self.streaming_text_block = None
@@ -631,9 +629,10 @@ class ChatView(QScrollArea):
         # Update tracking
         self.message_blocks = self.message_blocks[:idx]
 
-        # Clear references if removed
-        if self.current_tool_block and self.current_tool_block not in self.message_blocks:
-            self.current_tool_block = None
+        # Clear stale tool block references
+        self.tool_blocks = {
+            tid: blk for tid, blk in self.tool_blocks.items() if blk in self.message_blocks
+        }
         if self.thinking_block and self.thinking_block not in self.message_blocks:
             self.thinking_block = None
 
@@ -811,45 +810,134 @@ class StatusBar(QFrame):
 
         layout.addStretch()
 
-        # Usage stats
-        self.stats_label = QLabel("")
-        self.stats_label.setStyleSheet("color: #666;")
-        layout.addWidget(self.stats_label)
+        # Usage stats - clickable button styled as label
+        self.stats_btn = QPushButton("")
+        self.stats_btn.setStyleSheet(
+            """
+            QPushButton {
+                color: #666;
+                background: transparent;
+                border: none;
+                text-align: right;
+                padding: 0 4px;
+            }
+            QPushButton:hover {
+                color: #333;
+                text-decoration: underline;
+            }
+            """
+        )
+        self.stats_btn.setCursor(Qt.PointingHandCursor)
+        self.stats_btn.clicked.connect(self._show_stats_popup)
+        layout.addWidget(self.stats_btn)
 
         # Cache TTL indicator
         self.cache_indicator = CacheTTLIndicator()
         layout.addWidget(self.cache_indicator)
 
+        # Store request history for popup
+        self._request_stats: list[dict] = []
+        self._total_stats: dict = {}
+
     def set_status(self, status: str):
         self.status_label.setText(status)
+
+    @staticmethod
+    def _format_tokens(n: int) -> str:
+        """Format token count (e.g., 1234 -> '1.2k')."""
+        if n >= 1000:
+            return f"{n / 1000:.1f}k"
+        return str(n)
 
     def set_usage(self, usage: dict):
         """Display usage statistics."""
         if not usage:
-            self.stats_label.setText("")
+            self.stats_btn.setText("")
+            self._request_stats = []
+            self._total_stats = {}
             return
 
-        parts = []
-        input_tok = usage.get("input_tokens", 0)
-        output_tok = usage.get("output_tokens", 0)
-        cache_create = usage.get("cache_creation_input_tokens", 0)
-        cache_read = usage.get("cache_read_input_tokens", 0)
+        # Handle new format with requests list and total
+        if "requests" in usage and "total" in usage:
+            self._request_stats = usage["requests"]
+            self._total_stats = usage["total"]
+            total = usage["total"]
+        else:
+            # Legacy format (single usage dict)
+            self._request_stats = [usage]
+            self._total_stats = usage
+            total = usage
 
-        parts.append(f"In: {input_tok}")
-        parts.append(f"Out: {output_tok}")
+        # Display total in button using token flow format
+        # From cache (X) + new in (uncachable (Y) + cached (Z)) → out (W)
+        uncachable = total.get("input_tokens", 0)
+        output_tok = total.get("output_tokens", 0)
+        cached = total.get("cache_creation_input_tokens", 0)
+        from_cache = total.get("cache_read_input_tokens", 0)
 
-        if cache_read > 0:
-            parts.append(f"Cache: {cache_read}")
-        if cache_create > 0:
-            parts.append(f"CacheWrite: {cache_create}")
-            # Start TTL countdown when cache is written
+        # Compact format for status bar
+        fmt = self._format_tokens
+        text = f"⟳{fmt(from_cache)} + ({fmt(uncachable)} + {fmt(cached)}) → {fmt(output_tok)}"
+
+        # Add request count if multiple
+        if len(self._request_stats) > 1:
+            text += f" ({len(self._request_stats)} reqs)"
+
+        # Start TTL countdown when cache is written
+        if cached > 0:
             self.cache_indicator.start_countdown()
 
-        self.stats_label.setText(" | ".join(parts))
+        self.stats_btn.setText(text)
+
+    def _show_stats_popup(self):
+        """Show popup with per-request stats breakdown."""
+        if not self._request_stats:
+            return
+
+        # Build popup text using token flow format:
+        # From cache (X) + new in (uncachable (Y) + cached (Z)) → out (W)
+        lines = []
+        for i, req in enumerate(self._request_stats, 1):
+            uncachable = req.get("input_tokens", 0)
+            output_tok = req.get("output_tokens", 0)
+            cached = req.get("cache_creation_input_tokens", 0)
+            from_cache = req.get("cache_read_input_tokens", 0)
+
+            line = (
+                f"Request {i}: From cache ({from_cache}) + "
+                f"new in (uncachable ({uncachable}) + cached ({cached})) "
+                f"→ out ({output_tok})"
+            )
+            lines.append(line)
+
+        # Add total line
+        if len(self._request_stats) > 1 and self._total_stats:
+            lines.append("─" * 60)
+            total = self._total_stats
+            uncachable = total.get("input_tokens", 0)
+            output_tok = total.get("output_tokens", 0)
+            cached = total.get("cache_creation_input_tokens", 0)
+            from_cache = total.get("cache_read_input_tokens", 0)
+
+            line = (
+                f"Total: From cache ({from_cache}) + "
+                f"new in (uncachable ({uncachable}) + cached ({cached})) "
+                f"→ out ({output_tok})"
+            )
+            lines.append(line)
+
+        # Show in message box
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Usage Statistics")
+        msg.setText("\n".join(lines))
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec()
 
     def clear_stats(self):
         """Clear usage statistics and reset cache indicator."""
-        self.stats_label.setText("")
+        self.stats_btn.setText("")
+        self._request_stats = []
+        self._total_stats = {}
         self.cache_indicator.reset()
 
 
@@ -863,11 +951,19 @@ class ClaudeWidget(idaapi.PluginForm):
         self.client = None
         self.conv_manager = None
         self._parent_widget = None
-        self._current_tool_name = ""  # Track current tool for result summaries
+        self._tool_names: dict[str, str] = {}  # Track tool names by tool_id for result summaries
         # Tool approval (manual mode)
         self._approval_event = threading.Event()
         self._approval_result = False
         self._current_approval_id = ""
+        # Usage stats tracking
+        self._request_stats: list[dict] = []  # Each API response's stats
+        self._total_stats = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
 
     def OnCreate(self, form):
         self._parent_widget = self.FormToPyQtWidget(form)
@@ -939,9 +1035,9 @@ class ClaudeWidget(idaapi.PluginForm):
         btn_layout.addWidget(self.think_btn)
 
         self.think_budget_selector = QComboBox()
-        self.think_budget_selector.addItem("Light", 4096)
-        self.think_budget_selector.addItem("Medium", 10000)
-        self.think_budget_selector.addItem("Deep", 20000)
+        self.think_budget_selector.addItem("Light (4k)", 4096)
+        self.think_budget_selector.addItem("Medium (12k)", 12288)
+        self.think_budget_selector.addItem("Deep (24k)", 24576)
         self.think_budget_selector.setCurrentIndex(1)  # Default to Medium
         self.think_budget_selector.setEnabled(False)  # Disabled until thinking enabled
         self.think_budget_selector.setToolTip("Thinking budget (tokens)")
@@ -952,6 +1048,15 @@ class ClaudeWidget(idaapi.PluginForm):
         self.model_selector = QComboBox()
         self.model_selector.setMinimumWidth(150)
         btn_layout.addWidget(self.model_selector)
+
+        # Effort selector (Opus 4.5 only)
+        self.effort_selector = QComboBox()
+        self.effort_selector.addItem("High", "high")
+        self.effort_selector.addItem("Medium", "medium")
+        self.effort_selector.addItem("Low", "low")
+        self.effort_selector.setToolTip("Effort level (Opus 4.5 only)")
+        self.effort_selector.setVisible(False)  # Hidden by default
+        btn_layout.addWidget(self.effort_selector)
 
         layout.addLayout(btn_layout)
 
@@ -985,12 +1090,12 @@ class ClaudeWidget(idaapi.PluginForm):
             lambda t: self.chat_view.add_message(t, "assistant")
         )
         self.signals.add_tool_message.connect(
-            lambda header, raw: self.chat_view.add_message(
-                "", "tool", header_text=header, raw_text=raw
-            )
+            lambda tool_id, header, raw: self._add_tool_block(tool_id, header, raw)
         )
         self.signals.update_tool_result.connect(
-            lambda summary, raw: self.chat_view.update_tool_with_result(summary, raw)
+            lambda tool_id, summary, raw: self.chat_view.update_tool_with_result(
+                tool_id, summary, raw
+            )
         )
         self.signals.add_error_message.connect(lambda t: self.chat_view.add_message(t, "error"))
         self.signals.add_system_message.connect(lambda t: self.chat_view.add_message(t, "system"))
@@ -1035,6 +1140,7 @@ class ClaudeWidget(idaapi.PluginForm):
             thinking_enabled=config.thinking_enabled,
             thinking_budget=config.thinking_budget,
             interleaved_thinking=config.interleaved_thinking,
+            effort=config.effort,
         )
 
         self.agent = AgentLoop(
@@ -1065,6 +1171,16 @@ class ClaudeWidget(idaapi.PluginForm):
         budget_idx = self.think_budget_selector.findData(config.thinking_budget)
         if budget_idx >= 0:
             self.think_budget_selector.setCurrentIndex(budget_idx)
+
+        # Sync effort UI with config
+        effort_idx = self.effort_selector.findData(config.effort)
+        if effort_idx >= 0:
+            self.effort_selector.setCurrentIndex(effort_idx)
+        # Show effort selector only for Opus 4.5
+        is_opus = "opus-4-5" in config.model
+        self.effort_selector.setVisible(is_opus)
+        # Connect effort change
+        self.effort_selector.currentIndexChanged.connect(self._on_effort_changed)
 
         status = f"Ready. Model: {config.model}"
         if config.thinking_enabled:
@@ -1099,6 +1215,10 @@ class ClaudeWidget(idaapi.PluginForm):
             self.chat_view.add_message(
                 f"Switched to: {self.model_selector.currentText()}", "system"
             )
+
+            # Show/hide effort selector based on model
+            is_opus = "opus-4-5" in model_id
+            self.effort_selector.setVisible(is_opus)
 
             # Save to config
             from .config import get_config
@@ -1163,6 +1283,24 @@ class ClaudeWidget(idaapi.PluginForm):
             self.chat_view.add_message(
                 f"Thinking budget: {self.think_budget_selector.currentText()}", "system"
             )
+
+    def _on_effort_changed(self, index: int):
+        """Handle effort level change."""
+        if index < 0 or not self.client:
+            return
+
+        effort = self.effort_selector.itemData(index)
+        if effort:
+            self.client.effort = effort
+
+            # Save to config
+            from .config import get_config
+
+            config = get_config()
+            config.effort = effort
+            config.save()
+
+            self.chat_view.add_message(f"Effort: {effort}", "system")
 
     def _on_submit(self, text: str):
         if not text or not self.agent:
@@ -1233,6 +1371,14 @@ class ClaudeWidget(idaapi.PluginForm):
 
         self.signals.clear_chat.emit()
         self.status_bar.clear_stats()
+        # Reset usage tracking
+        self._request_stats = []
+        self._total_stats = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
         if self.agent:
             self.agent.clear_history()
         # Start a new conversation
@@ -1306,6 +1452,7 @@ class ClaudeWidget(idaapi.PluginForm):
                 thinking_enabled=config.thinking_enabled,
                 thinking_budget=config.thinking_budget,
                 interleaved_thinking=config.interleaved_thinking,
+                effort=config.effort,
             )
 
             # Update agent's client reference
@@ -1332,6 +1479,14 @@ class ClaudeWidget(idaapi.PluginForm):
             if self.agent:
                 self.agent.clear_history()
             self.status_bar.clear_stats()
+            # Reset usage tracking
+            self._request_stats = []
+            self._total_stats = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            }
             self.chat_view.add_message("Started new conversation.", "system")
         else:
             # Load existing conversation
@@ -1350,6 +1505,14 @@ class ClaudeWidget(idaapi.PluginForm):
         # Clear current UI
         self.signals.clear_chat.emit()
         self.status_bar.clear_stats()
+        # Reset usage tracking
+        self._request_stats = []
+        self._total_stats = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
 
         # Restore agent messages
         if self.agent:
@@ -1413,6 +1576,8 @@ class ClaudeWidget(idaapi.PluginForm):
 
     def _on_text_start(self):
         """Called when a text block starts streaming."""
+        # Remove any leftover "Thinking..." placeholder
+        self.signals.finish_thinking.emit("")
         agent_msg_idx = len(self.agent.messages) if self.agent else 0
         self.signals.start_text_block.emit(agent_msg_idx)
 
@@ -1431,8 +1596,19 @@ class ClaudeWidget(idaapi.PluginForm):
         self.signals.complete_text_block.emit(content)
 
     def _on_usage(self, usage: dict):
-        # Show stats from this API call (not accumulated)
-        self.signals.set_usage.emit(usage)
+        # Store this request's stats
+        self._request_stats.append(usage.copy())
+        # Accumulate totals
+        for key in usage:
+            if key in self._total_stats:
+                self._total_stats[key] = self._total_stats.get(key, 0) + usage.get(key, 0)
+        # Update UI with both per-request list and totals
+        self.signals.set_usage.emit(
+            {
+                "requests": self._request_stats,
+                "total": self._total_stats,
+            }
+        )
 
     def _summarize_tool_result(self, tool_name: str, result) -> str:
         """Generate smart summary for tool results."""
@@ -1521,6 +1697,11 @@ class ClaudeWidget(idaapi.PluginForm):
         s = str(result)
         return s[:50] + "..." if len(s) > 50 else s
 
+    def _add_tool_block(self, tool_id: str, header: str, raw_json: str):
+        """Add a tool block and track it by tool_id (fallback when streaming didn't create one)."""
+        block = self.chat_view.add_message("", "tool", header_text=header, raw_text=raw_json)
+        self.chat_view.tool_blocks[tool_id] = block
+
     def _on_tool_call(self, tool_call):
         # Remove the "Thinking..." placeholder if it wasn't replaced
         self.signals.finish_thinking.emit("")
@@ -1548,32 +1729,38 @@ class ClaudeWidget(idaapi.PluginForm):
         raw_json = json.dumps(raw_data, indent=2)
 
         # Update existing tool block (created by tool_start) or create new one
-        if self.chat_view.current_tool_block:
+        tool_block = self.chat_view.tool_blocks.get(tool_call.id)
+        if tool_block:
             # Update the header and raw text of existing block
-            self.chat_view.current_tool_block.header.setText(header)
-            self.chat_view.current_tool_block._raw_text = raw_json
-            self.chat_view.current_tool_block.set_text("")  # Clear "..." placeholder
+            tool_block.header.setText(header)
+            tool_block._raw_text = raw_json
+            tool_block.set_text("")  # Clear "..." placeholder
         else:
             # Fallback: create new block if tool_start didn't create one
-            self.signals.add_tool_message.emit(header, raw_json)
+            self.signals.add_tool_message.emit(tool_call.id, header, raw_json)
 
         self.signals.set_status.emit(f"Running {tool_call.name}...")
 
-        # Store tool name for result summary
-        self._current_tool_name = tool_call.name
+        # Store tool name for result summary (keyed by tool_id)
+        self._tool_names[tool_call.id] = tool_call.name
 
         # Start new thinking block for next response (after tool result comes back)
         self.signals.start_thinking.emit()
 
     def _on_tool_result(self, result):
+        tool_id = result.tool_call_id
+        tool_name = self._tool_names.get(tool_id, "unknown")
         if result.success:
             # Show smart summary
-            summary = self._summarize_tool_result(self._current_tool_name, result.result)
+            summary = self._summarize_tool_result(tool_name, result.result)
             # Build raw result JSON for copying
             raw_result = json.dumps(result.result, indent=2) if result.result else ""
-            self.signals.update_tool_result.emit(summary, raw_result)
+            self.signals.update_tool_result.emit(tool_id, summary, raw_result)
         else:
-            self.signals.add_error_message.emit(result.error)
+            # Update tool block with error
+            self.signals.update_tool_result.emit(tool_id, f"Error: {result.error}", "")
+        # Clean up tool name tracking
+        self._tool_names.pop(tool_id, None)
 
     def _on_tool_approve(self, tool_call) -> bool:
         """Called from background thread - must sync with UI for manual mode."""

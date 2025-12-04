@@ -73,6 +73,7 @@ class ClaudeClient:
         thinking_enabled: bool = False,
         thinking_budget: int = 10000,
         interleaved_thinking: bool = True,
+        effort: str = "high",
     ):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
@@ -81,13 +82,15 @@ class ClaudeClient:
         self.thinking_enabled = thinking_enabled
         self.thinking_budget = thinking_budget
         self.interleaved_thinking = interleaved_thinking
+        self.effort = effort
+
+    def _is_opus_model(self) -> bool:
+        """Check if current model supports effort parameter (Opus 4.5 only)."""
+        return "opus-4-5" in self.model
 
     def _get_extra_headers(self) -> dict | None:
-        """Get extra headers for API requests.
-
-        For direct Claude API calls, interleaved-thinking header has no effect
-        on non-Claude-4 models, so we can always pass it safely.
-        """
+        """Get extra headers for API requests."""
+        # Note: effort beta is handled via betas=[] param in beta endpoint, not here
         if self.thinking_enabled and self.interleaved_thinking:
             return {"anthropic-beta": "interleaved-thinking-2025-05-14"}
         return None
@@ -182,7 +185,16 @@ class ClaudeClient:
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
 
-        response = self.client.messages.create(**kwargs)
+        # Use beta endpoint for effort parameter (not supported in regular endpoint)
+        use_beta = self._is_opus_model() and self.effort != "high"
+        if use_beta:
+            response = self.client.beta.messages.create(
+                **kwargs,
+                betas=["effort-2025-11-24"],
+                output_config={"effort": self.effort},
+            )
+        else:
+            response = self.client.messages.create(**kwargs)
 
         # Parse response
         content = ""
@@ -273,7 +285,18 @@ class ClaudeClient:
         current_thinking: dict | None = None
         current_text_block = False  # Track if we're in a text block
 
-        with self.client.messages.stream(**kwargs) as stream:
+        # Use beta endpoint for effort parameter (not supported in regular endpoint)
+        use_beta = self._is_opus_model() and self.effort != "high"
+        if use_beta:
+            stream_ctx = self.client.beta.messages.stream(
+                **kwargs,
+                betas=["effort-2025-11-24"],
+                output_config={"effort": self.effort},
+            )
+        else:
+            stream_ctx = self.client.messages.stream(**kwargs)
+
+        with stream_ctx as stream:
             for event in stream:
                 if event.type == "content_block_start":
                     if event.content_block.type == "tool_use":

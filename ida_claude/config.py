@@ -19,6 +19,7 @@ class Config:
     thinking_enabled: bool = False
     thinking_budget: int = 10000  # tokens for thinking (min 1024)
     interleaved_thinking: bool = True  # Enable thinking between tool calls (Claude 4+)
+    effort: str = "high"  # Effort level: "high", "medium", "low" (Opus 4.5 only)
 
     @classmethod
     def load(cls) -> "Config":
@@ -49,6 +50,8 @@ class Config:
                         config.thinking_budget = data["thinking_budget"]
                     if "interleaved_thinking" in data:
                         config.interleaved_thinking = data["interleaved_thinking"]
+                    if "effort" in data:
+                        config.effort = data["effort"]
             except Exception:
                 pass
 
