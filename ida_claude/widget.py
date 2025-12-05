@@ -4,6 +4,7 @@ Custom chat widget for IDA Claude.
 Block-based chat UI where each message is a separate widget.
 """
 
+import html
 import json
 import threading
 
@@ -1687,11 +1688,9 @@ class ClaudeWidget(idaapi.PluginForm):
             return f"{verb}: {action}" if action else f"{verb} action"
 
         elif tool_name == "execute_script":
+            # Return full output (will be combined with code in _on_tool_result)
             output = result.get("output", "")
-            if output:
-                lines = output.count("\n") + 1
-                return f"Executed ({lines} lines output)"
-            return "Executed (no output)"
+            return output if output else "(no output)"
 
         # Fallback: truncate JSON
         s = str(result)
@@ -1710,34 +1709,55 @@ class ClaudeWidget(idaapi.PluginForm):
         # and filled by block start events and stream callbacks.
         # The tool block was created by tool_start, now update it with full args.
 
-        # Format args with colon style like Claude Code
-        args_str = ""
-        if tool_call.input:
-            args_parts = []
-            for k, v in tool_call.input.items():
-                # Quote strings, leave others as-is
-                v_str = f'"{v}"' if isinstance(v, str) else str(v)
-                if len(v_str) > 30:
-                    v_str = v_str[:27] + '..."'
-                args_parts.append(f"{k}: {v_str}")
-            args_str = ", ".join(args_parts)
+        # Special handling for execute_script: show full code in body
+        if tool_call.name == "execute_script":
+            header = f"\u25cf {tool_call.name}"  # ● execute_script (simple header)
+            code = tool_call.input.get("code", "")
+            raw_data = {"tool": tool_call.name, "input": tool_call.input}
+            raw_json = json.dumps(raw_data, indent=2)
 
-        header = f"\u25cf {tool_call.name}({args_str})"  # ● tool_name(args)
+            # Wrap code in <pre> tags to preserve formatting
+            code_html = f"<pre style='margin:0;white-space:pre-wrap;font-family:Consolas,monospace;'>{html.escape(code)}</pre>"
 
-        # Build raw JSON for copying
-        raw_data = {"tool": tool_call.name, "input": tool_call.input}
-        raw_json = json.dumps(raw_data, indent=2)
-
-        # Update existing tool block (created by tool_start) or create new one
-        tool_block = self.chat_view.tool_blocks.get(tool_call.id)
-        if tool_block:
-            # Update the header and raw text of existing block
-            tool_block.header.setText(header)
-            tool_block._raw_text = raw_json
-            tool_block.set_text("")  # Clear "..." placeholder
+            tool_block = self.chat_view.tool_blocks.get(tool_call.id)
+            if tool_block:
+                tool_block.header.setText(header)
+                tool_block._raw_text = code  # Plain text for copying AND for _on_tool_result
+                tool_block.content.setText(code_html)  # HTML directly to QLabel
+            else:
+                block = self.chat_view.add_message("", "tool", header_text=header, raw_text=code)
+                block._raw_text = code  # Plain text for copying AND for _on_tool_result
+                block.content.setText(code_html)  # HTML directly to QLabel
+                self.chat_view.tool_blocks[tool_call.id] = block
         else:
-            # Fallback: create new block if tool_start didn't create one
-            self.signals.add_tool_message.emit(tool_call.id, header, raw_json)
+            # Format args with colon style like Claude Code
+            args_str = ""
+            if tool_call.input:
+                args_parts = []
+                for k, v in tool_call.input.items():
+                    # Quote strings, leave others as-is
+                    v_str = f'"{v}"' if isinstance(v, str) else str(v)
+                    if len(v_str) > 30:
+                        v_str = v_str[:27] + '..."'
+                    args_parts.append(f"{k}: {v_str}")
+                args_str = ", ".join(args_parts)
+
+            header = f"\u25cf {tool_call.name}({args_str})"  # ● tool_name(args)
+
+            # Build raw JSON for copying
+            raw_data = {"tool": tool_call.name, "input": tool_call.input}
+            raw_json = json.dumps(raw_data, indent=2)
+
+            # Update existing tool block (created by tool_start) or create new one
+            tool_block = self.chat_view.tool_blocks.get(tool_call.id)
+            if tool_block:
+                # Update the header and raw text of existing block
+                tool_block.header.setText(header)
+                tool_block._raw_text = raw_json
+                tool_block.set_text("")  # Clear "..." placeholder
+            else:
+                # Fallback: create new block if tool_start didn't create one
+                self.signals.add_tool_message.emit(tool_call.id, header, raw_json)
 
         self.signals.set_status.emit(f"Running {tool_call.name}...")
 
@@ -1750,7 +1770,27 @@ class ClaudeWidget(idaapi.PluginForm):
     def _on_tool_result(self, result):
         tool_id = result.tool_call_id
         tool_name = self._tool_names.get(tool_id, "unknown")
-        if result.success:
+
+        # Special handling for execute_script: show code + output
+        if tool_name == "execute_script":
+            tool_block = self.chat_view.tool_blocks.get(tool_id)
+            if tool_block:
+                code = tool_block._raw_text  # Plain text code stored by _on_tool_call
+
+                if result.success:
+                    output = result.result.get("output", "") if result.result else ""
+                    display_output = output if output else "(no output)"
+                    plain_text = f"{code}\n\n--- Output ---\n{display_output}"
+                    html_display = f"<pre style='margin:0;white-space:pre-wrap;font-family:Consolas,monospace;'>{html.escape(code)}\n\n--- Output ---\n{html.escape(display_output)}</pre>"
+                else:
+                    plain_text = f"{code}\n\n--- Error ---\n{result.error}"
+                    html_display = f"<pre style='margin:0;white-space:pre-wrap;font-family:Consolas,monospace;'>{html.escape(code)}\n\n--- Error ---\n{html.escape(result.error)}</pre>"
+
+                tool_block.content.setText(html_display)  # HTML for display
+                tool_block._raw_text = plain_text  # Plain text for copying
+                # Remove from tracking
+                del self.chat_view.tool_blocks[tool_id]
+        elif result.success:
             # Show smart summary
             summary = self._summarize_tool_result(tool_name, result.result)
             # Build raw result JSON for copying
